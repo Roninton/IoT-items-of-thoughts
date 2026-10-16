@@ -1,0 +1,58 @@
+[project]
+name = "iot-items-of-thoughts"
+version = "0.1.0"
+description = "P/C 隔离长程编码实验 Server：冻结前缀 P + 结构化循环状态 C + 客观验证器"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov", "ruff"]
+
+[project.scripts]
+pciso = "pciso.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+# fakeimpl/ 不是平台源码：它是"假工作模型要吐出的数据"，不改写它的形态。
+# state/ 是运行期产物（含被生成工程的工作区）。
+exclude = ["src/pciso/fakeimpl", "state", "out"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "PIE", "RUF"]
+ignore = [
+    # 本项目注释与文档是中文。RUF001-003 会把全角标点（，。：）全部报成"有歧义"，
+    # 对中文代码库是纯噪声。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # 明确权衡：平台源码里中文注释与 docstring 表格很多，100 列硬约束的收益低于可读性损失。
+    # 注意这条**只影响平台自身**：被测项目的 C8 用 `ruff --isolated --line-length 100` 跑，
+    # 规则集与行宽完全由检查器钉死，不受本文件影响。
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里大量内嵌"待测源码 / 预期文本"的长字符串，硬折行会破坏可读性，
+# 也会让断言的期望值跟被测对象对不上。
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: 端到端 8 轮集成测试（会跑多轮真实验证器子进程）",
+]

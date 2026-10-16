@@ -1,0 +1,35 @@
+# 对话驱动 —— 给人用的那条路，**不是实验臂**。
+#
+# 机制参数与 C 组一致（P 冻结 + history_mode=state：每轮只给 P + C + 这一句话），
+# 只有两处不同：
+#   1. 轮数不封顶。实验臂要的是"七组各 8 轮"的可比曲线，所以 max_rounds=8；
+#      对话是长会话，八轮就锁死等于不能聊。
+#   2. chat_driven: true —— 阶段指令那段换成"该不该动手"的判断规则。
+#
+# 它不叫 arm_*.yaml，所以不会被当成第八组对照（test_config 只收集 arm_ 前缀）。
+session:
+  project: one_sentence_edit
+  label: 对话驱动（长会话）
+  arm: chat
+  prefix_path: prefixes/one_sentence_edit
+  fake_oracle: one_sentence_edit
+  max_rounds: 200
+  c_max_tokens: 2000
+  max_total_tokens: 0          # 0 = 不限；对话不该被矩阵那套预算拦腰截断
+  prefix_frozen: true
+  chat_driven: true
+  workspace_path: ../drawing-video-toolchain
+compression:
+  mode: fact_chain
+  model: deepseek-flash   # 压缩器不 thinking（用户口径）
+  thinking: false
+  max_tokens: 1200
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

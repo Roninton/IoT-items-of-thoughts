@@ -1,0 +1,153 @@
+# 接口契约（P 的一部分，只读冻结）
+#
+# 语义：符号**一旦被实现**，其签名就不得漂移（硬约束 C2）。
+# 未实现 = 完成度问题（软约束 C15），不是违反 —— 否则每个组第 1 轮都会被回退。
+#
+# signature 必须与 Python `ast.unparse` 的输出逐字一致（空白差异会被抹平）。
+# 方法签名含 self；module.symbol 是查表键，因此方法用**裸方法名**作为 symbol。
+
+contracts:
+  # ---- core：时间轴数据模型 ----
+  - module: drawvid.core
+    symbol: Size
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.core
+    symbol: Scene
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.core
+    symbol: CaptionCue
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.core
+    symbol: AudioEvent
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.core
+    symbol: Timeline
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.core
+    symbol: to_json
+    kind: method
+    signature: "to_json(self) -> str"
+    stage: 1
+
+  - module: drawvid.core
+    symbol: frame_count
+    kind: method
+    signature: "frame_count(self) -> int"
+    stage: 1
+
+  - module: drawvid.core
+    symbol: DrawvidError
+    kind: class
+    signature: ""
+    stage: 1
+
+  # ---- assets：纯标准库 PNG ----
+  - module: drawvid.assets
+    symbol: Image
+    kind: class
+    signature: ""
+    stage: 2
+
+  - module: drawvid.assets
+    symbol: get_pixel
+    kind: method
+    signature: "get_pixel(self, x: int, y: int) -> tuple[int, int, int, int]"
+    stage: 2
+
+  - module: drawvid.assets
+    symbol: put_pixel
+    kind: method
+    signature: "put_pixel(self, x: int, y: int, color: tuple[int, int, int, int]) -> None"
+    stage: 2
+
+  - module: drawvid.assets
+    symbol: new_image
+    kind: func
+    signature: "new_image(width: int, height: int, color: tuple[int, int, int, int]) -> Image"
+    stage: 2
+
+  - module: drawvid.assets
+    symbol: load_png
+    kind: func
+    signature: "load_png(path: str) -> Image"
+    stage: 2
+
+  - module: drawvid.assets
+    symbol: write_png
+    kind: func
+    signature: "write_png(image: Image, path: str) -> str"
+    stage: 3
+
+  - module: drawvid.assets
+    symbol: resize
+    kind: func
+    signature: "resize(image: Image, width: int, height: int) -> Image"
+    stage: 3
+
+  # ---- planner：一句话 -> Timeline ----
+  - module: drawvid.planner
+    symbol: plan_from_sentence
+    kind: func
+    signature: "plan_from_sentence(sentence: str, asset_paths: list[str]) -> Timeline"
+    stage: 4
+
+  # ---- render：时间即画面 ----
+  - module: drawvid.render
+    symbol: render_frame
+    kind: func
+    signature: "render_frame(timeline: Timeline, t_ms: int, images: dict[str, Image]) -> Image"
+    stage: 5
+
+  - module: drawvid.render
+    symbol: render_frames
+    kind: func
+    signature: "render_frames(timeline: Timeline, images: dict[str, Image]) -> list[Image]"
+    stage: 5
+
+  # ---- container：APNG / WebVTT / 播放页 ----
+  - module: drawvid.container
+    symbol: encode_apng
+    kind: func
+    signature: "encode_apng(frames: list[Image], out_path: str, fps: int = 30) -> str"
+    stage: 6
+
+  - module: drawvid.container
+    symbol: write_vtt
+    kind: func
+    signature: "write_vtt(timeline: Timeline, out_path: str) -> str"
+    stage: 6
+
+  - module: drawvid.container
+    symbol: write_player
+    kind: func
+    signature: "write_player(timeline: Timeline, out_dir: str) -> str"
+    stage: 6
+
+  # ---- audio：按时间轴合成 BGM ----
+  - module: drawvid.audio
+    symbol: synthesize_bgm
+    kind: func
+    signature: "synthesize_bgm(timeline: Timeline, out_path: str) -> str"
+    stage: 6
+
+  # ---- pipeline：编排 ----
+  - module: drawvid.pipeline
+    symbol: make_video
+    kind: func
+    signature: "make_video(sentence: str, assets_dir: str, out_dir: str) -> str"
+    stage: 8

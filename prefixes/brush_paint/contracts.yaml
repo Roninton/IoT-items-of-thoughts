@@ -1,0 +1,88 @@
+# 接口契约（P 的一部分，只读冻结）
+#
+# 语义：符号**一旦被实现**，其签名就不得漂移（硬约束 C2）。
+# 未实现 = 完成度问题（软约束 C15），不是违反 —— 否则每个组第 1 轮都会被回退。
+#
+# signature 必须与 Python `ast.unparse` 的输出逐字一致（空白差异会被抹平）。
+# 方法签名含 self；module.symbol 是查表键，因此方法用**裸方法名**作为 symbol。
+#
+# 模块名与层同名（layers.yaml 的 src_layer）：brushkit.core / .raster / .export / .undo / .cli。
+# 冻结测试会**顶层 import** 这些模块 —— 模块名或符号名不对，验收就是收集期报错。
+
+contracts:
+  # ---- core：画布与笔迹的数据模型 ----
+  - module: brushkit.core
+    symbol: Canvas
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: brushkit.core
+    symbol: Stroke
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: brushkit.core
+    symbol: BrushError
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: brushkit.core
+    symbol: blank_canvas
+    kind: func
+    signature: "blank_canvas(width: int, height: int) -> Canvas"
+    stage: 1
+
+  - module: brushkit.core
+    symbol: to_bytes
+    kind: method
+    signature: "to_bytes(self) -> bytes"
+    stage: 1
+
+  - module: brushkit.core
+    symbol: from_bytes
+    kind: method
+    signature: "from_bytes(self, data: bytes) -> None"
+    stage: 1
+
+  # ---- raster：一条 stroke 的光栅化 ----
+  - module: brushkit.raster
+    symbol: stroke_pixels
+    kind: func
+    signature: "stroke_pixels(canvas: Canvas, stroke: Stroke) -> None"
+    stage: 2
+
+  # ---- export：固定帧地址 ----
+  - module: brushkit.export
+    symbol: write_current_view
+    kind: func
+    signature: "write_current_view(canvas: Canvas, out_dir: str) -> str"
+    stage: 3
+
+  # ---- undo：连续撤回 ----
+  - module: brushkit.undo
+    symbol: UndoStack
+    kind: class
+    signature: ""
+    stage: 4
+
+  - module: brushkit.undo
+    symbol: push
+    kind: method
+    signature: "push(self) -> None"
+    stage: 4
+
+  - module: brushkit.undo
+    symbol: undo
+    kind: method
+    signature: "undo(self) -> bool"
+    stage: 4
+
+  # ---- cli：命令行与脚本解析 ----
+  - module: brushkit.cli
+    symbol: run
+    kind: func
+    signature: "run(argv: list[str] | None = None) -> int"
+    stage: 5

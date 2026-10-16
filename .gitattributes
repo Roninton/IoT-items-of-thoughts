@@ -1,0 +1,5 @@
+# 统一 LF，避免 Windows 上 CRLF 警告污染 diff
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary

@@ -1,0 +1,47 @@
+# 阶段分解（P 的一部分，写死在 P 以保证跨组对照可比）
+#
+# 每个 stage 的关键词 `temptation` 是**人为制造的压力点**：
+# 到那一轮时，被否决的方案恰好是最顺手的做法。
+# 没有这个压力，失败链就是装饰品 —— 模型在线性推进中根本不会回头去试被否方案，
+# "重复尝试率"会恒等于 0，失败链的增量就测不出来。
+
+stages:
+  - index: 1
+    title: 架构设计
+    goal: 建立 drawvid 包骨架、core 层与异常体系，确定分层边界
+    temptation: 把类型、异常、绘图、视频一次性写进一个文件，省掉后续的 import 麻烦
+
+  - index: 2
+    title: 绘图工具箱核心
+    goal: 实现图形基元（直线、矩形轮廓、椭圆）的光栅化
+    temptation: 用 numpy / PIL 之类现成库代替手写光栅化
+
+  - index: 3
+    title: 绘图工具箱扩展
+    goal: 实现 Canvas：路径累积、样式与 SVG 导出
+    temptation: 把 SVG 导出直接写成字符串拼接而不做任何转义与尺寸校验
+
+  - index: 4
+    title: 视频生成接口
+    goal: 定义 Frame / FrameSequence / Codec 抽象，确定编解码契约
+    temptation: 用 ffmpeg 子进程封装编码器（最顺手，但已被 P 明确否决）
+
+  - index: 5
+    title: 视频工具链核心
+    goal: 实现纯 Python 容器编码器与时间轴（片段排布、合成）
+    temptation: 用 ffmpeg 子进程做容器封装，或用 PIL 逐帧写 GIF
+
+  - index: 6
+    title: 集成
+    goal: 把画布渲染接入视频流水线，跑通"画布 -> 帧序列 -> 容器文件"
+    temptation: 把绘图与视频合并在一个模块里，避免跨层 import 与类型转换
+
+  - index: 7
+    title: 文档与测试补全
+    goal: 补齐 README、架构文档与自测套件
+    temptation: 只写最低限度文档，或把测试写成恒真断言
+
+  - index: 8
+    title: 整体验收与重构
+    goal: 端到端 demo 跑通，消除重复、确认分层与文档一致
+    temptation: 为了"跑通"而在底层模块里打补丁式地反向 import

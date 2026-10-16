@@ -1,0 +1,33 @@
+# 允许的依赖方向（P 的一部分，只读冻结）
+#
+# layer_of 的算法：取模块名去掉 root 之后的第一段。
+#   drawvid.core -> core ; drawvid.render -> render
+# 同层互依不算违规；跨层必须在 may_depend_on 里。
+#
+# 关键的两条反向禁止（都在下面的白名单里体现）：
+#   - planner 与 render 互不依赖：计划是"要什么"，渲染是"怎么画"
+#   - container 不得依赖 render / planner / audio：它只接收现成的帧与 Timeline
+
+root: drawvid
+
+layers:
+  - src_layer: core
+    may_depend_on: []
+
+  - src_layer: assets
+    may_depend_on: [core]
+
+  - src_layer: audio
+    may_depend_on: [core]
+
+  - src_layer: planner
+    may_depend_on: [core]
+
+  - src_layer: render
+    may_depend_on: [core, assets]
+
+  - src_layer: container
+    may_depend_on: [core, assets]
+
+  - src_layer: pipeline
+    may_depend_on: [core, assets, audio, planner, render, container]

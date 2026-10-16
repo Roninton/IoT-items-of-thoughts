@@ -1,0 +1,22 @@
+# 通用助手的约束：全部是**软**约束（只度量，不回退工作区）。
+#
+# 为什么这里能没有硬约束：硬约束的意义是"S 级回归 -> 回退这一轮的产出"，
+# 而通用助手没有一份冻结的需求原文可以当基准（那是实验载体的 P 才有资格做的事）。
+# 通用场景下唯一客观的硬闸是平台自带的那些（越界路径、冻结文件篡改、语法/依赖问题），
+# 它们由 HARD_CHECK_IDS 兜底，不在这里重复声明。
+constraints:
+  - id: G1
+    category: 范围
+    text: 只做这一轮被要求的事；不被要求的文件、模块、依赖一律不加。
+    check: manual_cohesion
+    hard: false
+  - id: G2
+    category: 诚实
+    text: 声称完成或验证过的内容必须对应真实发生的动作；没做过就说没做。
+    check: manual_cohesion
+    hard: false
+  - id: G3
+    category: 语言
+    text: 回复与代码注释用中文，不中途切换语言。
+    check: manual_cohesion
+    hard: false

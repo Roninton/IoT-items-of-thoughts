@@ -1,0 +1,39 @@
+# `/v1` 的默认配置：**上下文替换代理**。
+#
+# 与 `openai_chat.yaml` 的区别是本质的：这条路**不在服务端跑轮次** ——
+# 工具循环、文件读写、界面都在客户端（DSH 已经实现了 agent loop），服务端只做两件事：
+#   1. 转发：`tools` 与采样参数原样转给上游，`tool_calls` 与思考原样流回去
+#      （吞掉 `tools`，模型就没有工具可调 —— 那是"工具调用没了"的真因）；
+#   2. 替换上下文：客户端看到的整段历史里，只有**当前这一轮**原样留着；
+#      更早的轮次由 P + C 代表。而每个 thinking 块在它结束的那一刻就被提纯成
+#      思考节点（IoT items）—— 客户端看到的那一块就是**紧凑版**，原文不回显。
+#
+# 我们压的只有 thinking：工具往返由 server 零成本抽成 ACT 节点，正文与用户原话
+# 一律不进压缩器（用户指令不压缩）。所以这条路不落盘、不跑校验、不提交、不判定 ——
+# 那些仍然是实验臂（arm_*.yaml）的事。
+session:
+  project: general
+  label: OpenAI 兼容入口（上下文替换代理）
+  arm: chat
+  prefix_path: prefixes/general
+  max_rounds: 100000        # 代理模式不数轮次，给个大数免得被配置校验挡住
+  c_max_tokens: 0           # 0 = 不裁：边干边记时事实链还在长，裁剪会误伤刚提的节点
+  max_total_tokens: 0       # 0 = 不限
+  prefix_frozen: true
+  chat_driven: true
+compression:
+  mode: fact_chain
+  model: deepseek-flash     # 事实编排器不 thinking
+  thinking: false
+  scope: thinking           # 只压 thinking 块（full 是旧的"整轮 O_i"口径）
+  max_tokens: 1800
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true
+  max_tokens: 32000         # 思考也吃这个预算
+validator:
+  # 注意：YAML 1.1 里裸 `off` 会解析成布尔 False，这里必须带引号（真踩过）
+  tests: "off"
+  docs: "off"
+  constraints: "off"

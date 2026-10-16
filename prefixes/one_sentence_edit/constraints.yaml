@@ -1,0 +1,100 @@
+# 约束清单（P 的一部分，原文冻结；C 只能改 status/evidence，不得改 text）
+#
+# 这 15 条与 prefixes/drawing_video 逐字一致 —— 刻意如此：
+# 换项目载体时约束清单不变，跨载体的结论才可比。
+#
+# hard: true 的约束一旦**新出现**违反就回退该轮工作区（accept/revert 判定器）。
+# hard: false 的约束只**度量**、不回退 —— 否则"违反数随轮数"这条曲线会被判定器摁平成零。
+
+constraints:
+  # ---- 原始 9 条 ----
+  - id: C1
+    category: 架构
+    text: 模块边界清晰、单一职责；每个模块只承担一类职责
+    check: manual_cohesion
+    hard: false
+
+  - id: C2
+    category: 接口
+    text: 已定义接口的签名不得破坏
+    check: interface_contract
+    hard: true
+
+  - id: C3
+    category: 依赖
+    text: 不允许循环依赖
+    check: import_cycles
+    hard: true
+
+  - id: C4
+    category: 文档
+    text: 每个公开接口必须有 docstring
+    check: docstring_coverage
+    hard: false
+
+  - id: C5
+    category: 文档
+    text: README 与架构文档必须存在且可用
+    check: docs_presence
+    hard: false
+
+  - id: C6
+    category: 测试
+    text: 核心模块覆盖率 > 80%
+    check: coverage_proxy
+    hard: false
+
+  - id: C7
+    category: 测试
+    text: 每轮新增的公开功能必须有对应测试触达
+    check: feature_tests
+    hard: false
+
+  - id: C8
+    category: 代码
+    text: 遵循 PEP8（ruff 默认规则集）
+    check: ruff
+    hard: false
+
+  - id: C9
+    category: 工程
+    text: 不允许 TODO / FIXME / XXX 残留
+    check: todo_residue
+    hard: false
+
+  # ---- 结构性补充（长程退化真正会显形的地方）----
+  - id: C10
+    category: 测试
+    text: 冻结一致性测试不得被修改、删除、重命名或跳过
+    check: frozen_tests
+    hard: true
+
+  - id: C11
+    category: 接口
+    text: 接口签名变更时必须同步更新全部调用点
+    check: stale_callers
+    hard: true
+
+  - id: C12
+    category: 架构
+    text: 依赖方向不得逆向，必须遵守 P 中定义的分层
+    check: layer_violation
+    hard: true
+
+  - id: C13
+    category: 文档
+    text: 签名未变更时不得删除或弱化已有 docstring
+    check: docstring_drift
+    hard: false
+
+  - id: C14
+    category: 测试
+    text: 不得删除或弱化既有测试用例
+    check: test_weakening
+    hard: true
+
+  - id: C15
+    category: 接口
+    text: 交付时必须实现 P 定义的全部接口契约
+    check: contract_completeness
+    hard: false

@@ -1,0 +1,34 @@
+# OpenAI 兼容入口的默认配置 —— 给人、给别的 agent 当"一个模型"用的那条路。
+#
+# 它**不是实验臂**（不叫 arm_*.yaml），机制参数与 C 组一致：
+# P 冻结 + history_mode=state（每轮只给 P + C + 这一轮那句话）。
+# 差别只有两处：
+#   1. max_rounds=200 —— 对话是长会话，八轮锁死等于不能聊。
+#   2. chat_driven: true —— 阶段指令那段换成"该不该动手"的判断规则。
+#
+# 不写 workspace_path：会话各自落在 state/workspaces/<sid>（scratch），
+# 绝不碰交付仓库 drawing-video-toolchain。
+session:
+  project: general
+  label: OpenAI 兼容入口（通用助手）
+  arm: chat
+  prefix_path: prefixes/general
+  max_rounds: 200
+  c_max_tokens: 2000
+  max_total_tokens: 0          # 0 = 不限
+  prefix_frozen: true
+  chat_driven: true
+compression:
+  mode: fact_chain
+  model: deepseek-flash        # 事实编排器不 thinking
+  thinking: false
+  max_tokens: 1200
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true
+  max_tokens: 32000            # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

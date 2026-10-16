@@ -1,0 +1,30 @@
+# 允许的依赖方向（P 的一部分，只读冻结）
+#
+# layer_of 的算法：取模块名去掉 root 之后的第一段。
+#   brushkit.core -> core ; brushkit.raster -> raster
+# 同层互依不算违规；跨层必须在 may_depend_on 里。
+
+root: brushkit
+
+layers:
+  - src_layer: core
+    may_depend_on: []
+
+  - src_layer: raster
+    may_depend_on: [core]
+
+  - src_layer: export
+    may_depend_on: [core]
+
+  - src_layer: undo
+    may_depend_on: [core]
+
+  - src_layer: cli
+    may_depend_on: [core, raster, export, undo]
+
+  # 入口文件单独算一层。**这一层不能省**：
+  # layer_of 取模块名去掉 root 后的第一段，`brushkit/__main__.py` 会被算成 `__main__` 层；
+  # 层规则里没定义它 → "越层依赖" → 硬约束 C12 新违反 → 整轮（含刚写好的 CLI）被回退。
+  # 真机踩过：笔刷载体的收尾轮就是这么被回退的，冻结验收测试因此一直红。
+  - src_layer: __main__
+    may_depend_on: [cli]

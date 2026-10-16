@@ -1,0 +1,39 @@
+# pciso 运行期状态
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 本地模型/凭据覆盖，永不入库
+models.local.yaml
+.env
+*.key
+
+# out/ = 临时分析脚本与再生成的报告，不入库
+out/
+
+# 前端排练用的临时状态目录（真实验数据在 state/）
+state-ui/
+state-rehearsal/
+
+# state/ = 运行数据（逐轮轨迹、快照、thinking 原文、会话注册表）。它按轮数线性涨
+# （20MB+、上千文件），属于**盘上留档**而不是版本库内容；
+# "做了什么实验、拿到什么结果"由 docs/experiment-log.md 承担。
+state/
+
+# 旧实验配置（七臂 A–G + 冒烟）留档在 experiment/configs-archive/，不进版本库。
+# configs/ 里只留在用的那几个：openai_proxy / openai_chat / chat / chat_think / chat_brush。
+# 搬运过来的实验产物（工作区快照、评测输出），不进版本库
+experiment/
+
+# 一次性探针脚本与它们的输出（创造者指定：以后都放这里，不进版本库）
+tmp/

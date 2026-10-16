@@ -1,0 +1,31 @@
+# 对话驱动 · 笔刷载体 —— 给人用的那条路，**不是实验臂**。
+#
+# 与 chat.yaml 逐项一致，只有两处不同：
+#   project / prefix_path 指向 prefixes/brush_paint（"笔刷画画"那份需求原文）。
+# 机制不动：P 冻结 + history_mode=state —— 每轮送进模型的只有 P + C + 这一句话，
+# 压缩调用发生在正文产出之后（compression.mode: fact_chain）。
+session:
+  project: brush_paint
+  label: 对话驱动（笔刷载体）
+  arm: chat
+  prefix_path: prefixes/brush_paint
+  max_rounds: 200
+  c_max_tokens: 2000
+  max_total_tokens: 0          # 0 = 不限
+  prefix_frozen: true
+  chat_driven: true
+  workspace_path: experiment/brush-scratch3
+compression:
+  mode: fact_chain
+  model: deepseek-flash   # 压缩器不 thinking
+  thinking: false
+  max_tokens: 1200
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

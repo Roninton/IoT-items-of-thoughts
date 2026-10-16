@@ -1,0 +1,66 @@
+# 接口契约（P 的一部分，只读冻结）
+#
+# 语义：符号**一旦被实现**，其签名就不得漂移（硬约束 C2）。
+# 未实现 = 完成度问题（软约束 C15），不是违反 —— 否则每个组在第 1 轮都会被回退。
+#
+# signature 必须与 Python `ast.unparse` 的输出逐字一致（空白差异会被抹平）。
+# 方法签名含 self。module.symbol 是查表键，因此方法用**裸方法名**作为 symbol。
+
+contracts:
+  - module: drawvid.core
+    symbol: Point
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.core
+    symbol: Rect
+    kind: class
+    signature: ""
+    stage: 1
+
+  - module: drawvid.drawing
+    symbol: line
+    kind: func
+    signature: "line(x0: int, y0: int, x1: int, y1: int) -> list[Point]"
+    stage: 2
+
+  - module: drawvid.drawing
+    symbol: rect
+    kind: func
+    signature: "rect(r: Rect) -> list[Point]"
+    stage: 2
+
+  # Canvas.to_svg
+  - module: drawvid.drawing
+    symbol: to_svg
+    kind: method
+    signature: "to_svg(self) -> str"
+    stage: 3
+
+  # FrameSequence.append
+  - module: drawvid.video
+    symbol: append
+    kind: method
+    signature: "append(self, frame: Frame) -> int"
+    stage: 4
+
+  # Codec.encode
+  - module: drawvid.video
+    symbol: encode
+    kind: method
+    signature: "encode(self, sequence: FrameSequence) -> bytes"
+    stage: 4
+
+  # Timeline.duration_ms
+  - module: drawvid.video
+    symbol: duration_ms
+    kind: method
+    signature: "duration_ms(self) -> int"
+    stage: 5
+
+  - module: drawvid.pipeline
+    symbol: build_video
+    kind: func
+    signature: "build_video(seq: FrameSequence, out_path: str) -> str"
+    stage: 6

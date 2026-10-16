@@ -1,0 +1,23 @@
+# 允许的依赖方向（P 的一部分，只读冻结）
+#
+# layer_of 的算法：取模块名去掉 root 之后的第一段。
+#   drawvid.core       -> core
+#   drawvid.drawing    -> drawing
+#   drawvid.video      -> video
+#   drawvid.pipeline   -> pipeline
+# 同层互依不算违规；跨层必须在 may_depend_on 里。
+
+root: drawvid
+
+layers:
+  - src_layer: core
+    may_depend_on: []
+
+  - src_layer: drawing
+    may_depend_on: [core]
+
+  - src_layer: video
+    may_depend_on: [core]
+
+  - src_layer: pipeline
+    may_depend_on: [core, drawing, video]

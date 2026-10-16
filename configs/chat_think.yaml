@@ -1,0 +1,37 @@
+# 推理编排原型 —— 只压 thinking，动作由 server 记（README §1.3）。
+#
+# 与 chat.yaml 的机制参数只差一处：`compression.scope: thinking`。
+#   full      整轮 O_i 进提取器（七个实验臂的口径）
+#   thinking  只把 **thinking 块**编成关键推理节点（正/负）；已发生的动作由 server 从
+#             写盘结果确定性渲染成 ACT 节点（零模型调用），正文不进 C。
+#
+# 它不叫 arm_*.yaml，不会被当成对照组（test_config 只收 arm_ 前缀）。
+session:
+  project: general
+  label: 推理编排原型（只压 thinking）
+  arm: chat
+  prefix_path: prefixes/general
+  max_rounds: 200
+  c_max_tokens: 2000
+  max_total_tokens: 0
+  prefix_frozen: true
+  chat_driven: true
+  workspace_path: experiment/think-scratch
+compression:
+  mode: fact_chain
+  model: deepseek-flash
+  thinking: false
+  # 1200 是整轮 O_i 口径留下的数；现在输入只有一段 thinking，1200 会把节点挤成
+  # "只留最核心的几条"（真机实测：11614 字 thinking 触发一次截断重试，异常类型分工被压掉）。
+  # C 自己的预算是 c_max_tokens=2000，节点总量远没到，放宽输出没有溢出风险。
+  max_tokens: 1800
+  scope: thinking
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true
+  max_tokens: 32000         # 思考也吃这个预算
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list
