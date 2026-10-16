@@ -1,0 +1,26 @@
+# C 组 —— 本方案：P 冻结 + 事实链/失败链迭代
+session:
+  project: one_sentence_edit
+  arm: C
+  label: P/C 隔离 + 事实链/失败链（目标方案）
+  prefix_path: prefixes/one_sentence_edit
+  fake_oracle: one_sentence_edit
+  max_rounds: 8
+  c_max_tokens: 2000
+  max_total_tokens: 3000000
+  prefix_frozen: true
+  workspace_path: ../drawing-video-toolchain
+compression:
+  mode: fact_chain
+  model: deepseek-flash   # 压缩器不 thinking（用户口径）
+  thinking: false
+  max_tokens: 1200
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true          # 按设计原文「工作模型 thinking 开」；实测 8000 不够（思考吃满、正文为空）
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

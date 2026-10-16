@@ -1,0 +1,29 @@
+# F 组 —— 无状态阶段推进（最关键的对照之一）
+#
+# 每轮只给 P + "做第 k 阶段"：既不给历史也不给 C、也不给工作区清单。
+# 如果 F 的违反曲线和 C 差不多，那么 C 的全部贡献是零 ——
+# 增益来自 P 的阶段分解，而不是工作记忆。
+session:
+  project: one_sentence_edit
+  arm: F
+  label: 无状态阶段推进（P+阶段指令，无历史无 C 无清单）
+  prefix_path: prefixes/one_sentence_edit
+  c_max_tokens: 2000
+  max_total_tokens: 3000000
+  fake_oracle: one_sentence_edit
+  max_rounds: 8
+  prefix_frozen: true
+  stateless: true
+  workspace_path: ../drawing-video-toolchain
+compression:
+  mode: "off"
+  model: heuristic
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true          # 按设计原文「工作模型 thinking 开」；实测 8000 不够（思考吃满、正文为空）
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

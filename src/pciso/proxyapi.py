@@ -205,6 +205,26 @@ _PATH_KEYS = ("path", "file_path", "filepath", "filename", "file", "target", "ta
 _WRITE_TOOL_RE = re.compile(r"write|edit|create|patch|replace|insert|append|apply", re.IGNORECASE)
 
 
+def _norm_path(root: Path | None, raw: str) -> str:
+    """把路径归一成「相对工作区根」的 posix 形式（求不出来时就只做分隔符/前缀归一）。
+
+    为什么必须归一：工具给的是**绝对**路径（DSH 实测 `D:\\_playground\\workspace\\oneline\\out\\x.png`），
+    模型写的 anchor 是**相对**路径（`oneline/out/x.png`）。不归一化两边永远对不上 ——
+    真机后果是 ACT 一条都落不下来，带路径的思考节点还被当「编路径」丢掉（`kept=0`）。
+    """
+    s = str(raw or "").replace("\\", "/").strip()
+    if not s:
+        return ""
+    if root is not None:
+        try:
+            p = Path(s)
+            target = p if p.is_absolute() else (root / p)
+            return target.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            pass
+    return s[2:] if s.startswith("./") else s
+
+
 def _path_from_args(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
@@ -220,11 +240,13 @@ def _path_from_args(raw: Any) -> str:
     return ""
 
 
-def write_calls(messages: Sequence[dict[str, Any]]) -> list[tuple[str, str]]:
-    """客户端这一轮点过名的写操作：`(tool_call_id, 相对路径)`。
+def write_calls(
+    messages: Sequence[dict[str, Any]], root: Path | None = None
+) -> list[tuple[str, str]]:
+    """客户端这一轮点过名的写操作：`(tool_call_id, 归一化后的路径)`。
 
     只看工具的**参数**（客户端发上来的事实）。文件是否真的写了，要等它的工具结果
-    回来，并且盘上真有这个文件 —— 那一步在 `pending_actions` 里做。
+    回来，并且盘上真有这个文件 —— 那一步在 `absorb_actions` 里做。
     """
     out: list[tuple[str, str]] = []
     for msg in messages:
@@ -235,7 +257,7 @@ def write_calls(messages: Sequence[dict[str, Any]]) -> list[tuple[str, str]]:
                 continue
             path = _path_from_args((fn or {}).get("arguments") or call.get("arguments"))
             if path:
-                out.append((str(call.get("id") or ""), path))
+                out.append((str(call.get("id") or ""), _norm_path(root, path)))
     return out
 
 
@@ -271,17 +293,176 @@ def _read_sources(root: Path | None, paths: Sequence[str]) -> dict[str, str]:
 
 
 def _written_triples(root: Path | None, paths: Sequence[str]) -> list[tuple[str, str, int]]:
-    """`(路径, sha256, 字节数)` —— 只有盘上真有这个文件才算"写了"。"""
+    """`(路径, sha256, 字节数)` —— 只有盘上真有这个文件才算"写了"。
+
+    路径一律归一成"相对工作区根"的 posix 形式（`_norm_path`）。根**没配**时，绝对路径
+    照样能核对 —— 别因为少配一个环境变量就把整条 ACT 通道静默关掉（真机就是这么丢的）。
+    """
     triples: list[tuple[str, str, int]] = []
-    if root is None:
-        return triples
-    for rel in dict.fromkeys(paths):
+    for raw in dict.fromkeys(str(p) for p in paths if p):
+        norm = _norm_path(root, raw)
+        if not norm:
+            continue
+        target = Path(norm)
+        if not target.is_absolute():
+            if root is None:
+                continue
+            target = root / norm
         try:
-            data = (root / rel).read_bytes()
+            data = target.read_bytes()
         except OSError:
             continue
-        triples.append((rel, hashlib.sha256(data).hexdigest(), len(data)))
+        triples.append((norm, hashlib.sha256(data).hexdigest(), len(data)))
     return triples
+
+
+# --------------------------------------------------------------------------- #
+# 循环检测：工具往返的指纹（零模型调用，纯字符串比对）
+# --------------------------------------------------------------------------- #
+
+LOOP_WINDOW = 12
+LOOP_REPEAT = 3
+STALL_STEPS = 3
+LOOP_REPORTED_MAX = 40
+
+_ERROR_HINTS = (
+    "does not declare image input",
+    "permission denied",
+    "no such file or directory",
+    "cannot read ",
+    "[exit code: 1",
+    "[exit code: 2",
+    "command not found",
+    "access is denied",
+    "sandbox: file access denied",
+)
+_ERROR_HEADS = ("error", "exception", "traceback", "fatal", "panic", "failed")
+
+
+def result_is_error(text: str) -> bool:
+    """工具结果是不是报错 —— 只看退出码与固定报错串，不看模型的自述。"""
+    body = (text or "").strip()
+    if not body:
+        return False
+    low = body.lower()
+    if any(h in low for h in _ERROR_HINTS):
+        return True
+    first = low.splitlines()[0].strip()
+    return any(first.startswith(h) for h in _ERROR_HEADS)
+
+
+def tool_trail(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """这一轮工具往返的轨迹（客户端发上来的原始事实）。
+
+    每个元素 `{id, name, args, fp, result, error}`；`fp` 是 `(工具名 + 排序后的参数)`
+    的短哈希 —— 循环按指纹聚合，同样的调用换个参数顺序也算同一个。
+    """
+    results = {
+        str(m.get("tool_call_id") or ""): _text_of(m.get("content"))
+        for m in messages
+        if m.get("role") == "tool"
+    }
+    trail: list[dict[str, Any]] = []
+    for msg in messages:
+        for call in _tool_calls_of(msg):
+            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            name = str((fn or {}).get("name") or call.get("name") or "")
+            args = str((fn or {}).get("arguments") or call.get("arguments") or "")
+            try:
+                norm_args = json.dumps(json.loads(args), sort_keys=True, ensure_ascii=False)
+            except ValueError:
+                norm_args = args
+            call_id = str(call.get("id") or "")
+            result = results.get(call_id, "")
+            trail.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "args": norm_args,
+                    "fp": hashlib.sha1(f"{name}|{norm_args}".encode()).hexdigest()[:12],
+                    "result": result,
+                    "error": result_is_error(result),
+                }
+            )
+    return trail
+
+
+def loop_report(messages: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """循环/停滞的信号：重复指纹、连续报错、只说不做的步数、成功回执数。"""
+    trail = tool_trail(messages)
+    window = trail[-LOOP_WINDOW:]
+    counts: dict[str, int] = {}
+    for step in window:
+        counts[step["fp"]] = counts.get(step["fp"], 0) + 1
+    failures: dict[str, list[dict[str, Any]]] = {}
+    for step in window:
+        if step["error"]:
+            failures.setdefault(step["fp"], []).append(step)
+    failing = [
+        (steps[-1]["name"], len(steps), steps[-1]["result"])
+        for steps in failures.values()
+        if len(steps) >= 2
+    ]
+    plan_only = 0
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        if _tool_calls_of(msg):
+            break
+        plan_only += 1
+    return {
+        "calls": len(trail),
+        "window": len(window),
+        "repeated": [fp for fp, n in counts.items() if n >= LOOP_REPEAT],
+        "failing": sorted(failing, key=lambda item: -item[1]),
+        "plan_only_steps": plan_only,
+        "ok": sum(1 for step in trail if step["result"] and not step["error"]),
+    }
+
+
+def loop_warning(report: dict[str, Any]) -> str:
+    """把循环/停滞写成给模型看的硬事实（挂进请求末尾那块，不占 C）。"""
+    lines: list[str] = []
+    if report.get("failing"):
+        name, count, last = report["failing"][0]
+        tail = " ".join((last or "").split())[:200]
+        lines.append(
+            f"【循环告警】{name} 已经连续 {count} 次返回同一类报错"
+            f"（最近一次：{tail or '（无正文）'}）。不要再调用它 —— 换参数、换工具，"
+            "或者把这条记成「当前不可用」往下走。"
+        )
+    if int(report.get("plan_only_steps") or 0) >= STALL_STEPS:
+        lines.append(
+            f"【停滞告警】最近 {report['plan_only_steps']} 步你只写了话，没有发出任何工具调用。"
+            "下一步只允许一件事：发一个工具调用，不要写计划。"
+        )
+    elif report.get("repeated"):
+        lines.append(
+            f"【循环告警】同一组调用（指纹 {report['repeated'][0]}）在最近 {report['window']} 步里"
+            f"出现了 {LOOP_REPEAT} 次以上 —— 它没有让事情往前走。换个做法。"
+        )
+    return "\n".join(lines)
+
+
+def _report_tool_errors(
+    session: Any, messages: Sequence[dict[str, Any]], meta: dict[str, Any]
+) -> list[tuple[str, int, str]]:
+    """同一个工具连续报错 → 失败链 + `[否掉]` 负节点（每个增量只记一次）。"""
+    failing = loop_report(messages)["failing"]
+    if not failing:
+        return []
+    reported = {str(k): int(v) for k, v in (meta.get("proxy_loop_reported") or {}).items()}
+    fresh = [item for item in failing if item[1] > reported.get(item[0], 0)]
+    if not fresh:
+        return []
+    try:
+        session.absorb_tool_failures(errors=[(name, count, last) for name, count, last in fresh])
+    except Exception as exc:
+        print(f"[v1:proxy] tool errors not recorded: {type(exc).__name__}: {exc}")
+        return []
+    reported.update({name: count for name, count, _ in fresh})
+    session.store.patch_meta(proxy_loop_reported=dict(list(reported.items())[-LOOP_REPORTED_MAX:]))
+    return fresh
 
 
 # --------------------------------------------------------------------------- #
@@ -302,9 +483,10 @@ def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str
         for m in messages
         if m.get("role") == "tool"
     }
+    root = workspace_root(session)
     turn_paths: list[str] = []
     fresh: list[tuple[str, str]] = []
-    for call_id, path in write_calls(messages):
+    for call_id, path in write_calls(messages, root):
         if path not in turn_paths:
             turn_paths.append(path)
         if not call_id or call_id in done or call_id not in results:
@@ -313,7 +495,6 @@ def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str
 
     out: dict[str, Any] = {"paths": turn_paths, "act_nodes": 0, "fresh": len(fresh)}
     if fresh:
-        root = workspace_root(session)
         triples = _written_triples(root, [p for _, p in fresh])
         verify, verify_state = _verify_from(list(results.values()))
         out["written"] = [t[0] for t in triples]
@@ -330,6 +511,9 @@ def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str
         session.store.patch_meta(
             proxy_tools_done=[*list(done), *(cid for cid, _ in fresh)][-TOOLS_DONE_MAX:]
         )
+    errors = _report_tool_errors(session, messages, meta)
+    if errors:
+        out["tool_errors"] = errors
     return out
 
 
@@ -416,7 +600,7 @@ def context_block(session: Any) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def volatile_block(session: Any) -> str:
+def volatile_block(session: Any, messages: Sequence[dict[str, Any]] = ()) -> str:
     """**会变**的那一半：C（每段思考过后就长长）+ 用户原话（每轮追加）。
 
     位置很要紧：必须挂在请求**末尾**。前缀缓存算的是"从头开始的最长公共前缀"，头部一变，
@@ -426,7 +610,12 @@ def volatile_block(session: Any) -> str:
     这一块变）：插在头部 27.5% → 挂到末尾 91.3% → 完全不带它（上界）98.3%。
     线上低命中那几次的 cached 恰好只剩 ~1920 token（客户端 system + 固定说明），同一个指纹。
     """
-    parts = [render_state_block(session.state()).strip()]
+    parts = []
+    warning = loop_warning(loop_report(messages)) if messages else ""
+    if warning:
+        # 循环/停滞是**硬事实**（工具的返回就在上面），放在这块的最前面：它比 C 更急。
+        parts.append(warning)
+    parts.append(render_state_block(session.state()).strip())
     words = session.user_words()[-USER_WORDS_MAX:]
     if words:
         parts.append(render_user_words(words).strip())
@@ -476,7 +665,7 @@ def forward_payload(body: dict[str, Any], session: Any, *, mode: str | None = No
     payload = {k: v for k, v in body.items() if k not in ("messages", "model", "stream_options")}
     payload["model"] = session.cfg.work_model.model
     payload["messages"] = _with_context(head, context_block(session)) + tail
-    volatile = volatile_block(session)
+    volatile = volatile_block(session, messages)
     if volatile:
         # 会变的那块挂在**最后**（不能跟固定说明一起塞进头部）：见 volatile_block 的实测数字。
         sent = payload["messages"]

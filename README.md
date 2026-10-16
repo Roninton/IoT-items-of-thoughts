@@ -373,6 +373,27 @@ DSH 侧已经有 agent loop（它 filter assistant 的 `tool-call` 块去执行�
 轮次记录落 `rounds.jsonl`（`kind` ∈ `thinking_block` / `tool_actions`，`c_i` 就是那个事实链，
 用 `scripts/_inspect_proxy_c.py` 看）；上游拒绝的原文记进 `events.jsonl` 的 `proxy_upstream_error`。
 
+一轮里服务端还会顺手做四件事（都零模型调用，读的全是客户端发来的原始事实）：
+
+- **路径归一化**：工具给的是绝对路径（`D:\_playground\workspace\oneline\out\x.png`），模型写的
+  anchor 是相对路径（`oneline/out/x.png`）—— 两侧都按工作区根归一成 posix 相对路径再比，并按 `/`
+  边界做双向后缀匹配。不归一化的话 ACT 一条都落不下来、带路径的思考节点还会被判成"编路径"丢掉
+  （真机：298 轮 `kept=0`、`think_dropped_unanchored=27`）。
+- **工具报错进链**：同一个工具连续 ≥2 次返回同一类报错 → 失败链一条 + 一条 `[否掉]` 负节点
+  （`不再调用 X（连续 N 次报错，这条路当前不可用）`），计数记在 meta `proxy_loop_reported`，
+  每个增量只记一次。报错本来只活在当轮消息里、一被吸收就没了，于是模型没有回执可读，只能反复写
+  "我这就去读"。
+- **循环 / 停滞告警**：`loop_report()` 只看客户端发来的工具往返（同一调用指纹 ≥3 次、同指纹连续报错、
+  连续 N 步只有话没有工具调用），命中就往请求末尾那块注入一行【循环告警】/【停滞告警】。不占 C、
+  不花模型调用；停滞那条同时是断路开关 ——「下一步只允许一件事：发一个工具调用，不要写计划」。
+- **进度不再等于自述**：链上一条 ACT 都没有时，【当前进度】渲染成【自述进度·无工具回执核对】，
+  并补一行【验证状态】0 条物证。实测（会话 `d87b61bb051b4849`）【当前进度】逐字就是模型自己写的
+  "本轮打破只规划不执行的僵局：直接并行发 pwsh 列目录 + read_image"，它读到就以为已经执行了。
+
+上游脾气：thinking 模式下历史里的 assistant 消息必须把 `reasoning_content` 带回来，否则 400
+`The reasoning_content in the thinking mode must be passed back to the API.`（探针实测）。`drop`
+臂把思考删干净就必然撞上这条 —— 它是"故意破坏"的对照臂，别在它上面跑长任务。
+
 真机冒烟（`scripts/_smoke_iot_stream.py`，纯推理题、3976 字思考）：客户端看到 **1259 字 13 条 THINK**
 （压缩比 0.32），原文没泄漏、落盘可审计、C 记 1 条 `kind=thinking_block`。
 修前同题是 `think_dropped_unanchored=12` —— 不碰文件的思考没有锚点可挂，12 条全被丢，紧凑版为空、

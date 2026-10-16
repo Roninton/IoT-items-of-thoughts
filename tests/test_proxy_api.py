@@ -442,3 +442,125 @@ def test_the_upstream_stream_is_read_decoded_not_raw(monkeypatch) -> None:
     session = _fake_session()
     out = b"".join(proxyapi.upstream_sse({"model": "x"}, session))
     assert out == b"data: ok\n\n"
+
+
+# --------------------------------------------------------------------------- #
+# 路径归一化：工具的绝对路径 vs 模型写的相对 anchor
+# --------------------------------------------------------------------------- #
+
+
+def test_the_same_file_is_recognised_no_matter_which_side_wrote_it(tmp_path) -> None:
+    """工具给绝对路径、模型写相对路径 —— 不归一化就永远对不上，ACT 一条都落不下来。"""
+    root = tmp_path / "ws"
+    (root / "oneline" / "out").mkdir(parents=True)
+    target = root / "oneline" / "out" / "x.png"
+    target.write_bytes(b"png")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json.dumps({"file_path": str(target)}, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "created"},
+    ]
+    assert proxyapi.write_calls(messages, root) == [("c1", "oneline/out/x.png")]
+    triples = proxyapi._written_triples(root, [str(target)])
+    assert triples[0][0] == "oneline/out/x.png"
+    assert len(triples[0][1]) == 64
+    # 根没配的时候，绝对路径照样能核对：别因为少一个环境变量就把 ACT 通道静默关掉
+    assert proxyapi._written_triples(None, [str(target)])[0][0] == str(target).replace("\\", "/")
+
+
+# --------------------------------------------------------------------------- #
+# 循环检测（零模型调用）
+# --------------------------------------------------------------------------- #
+
+
+def test_result_is_error_only_looks_at_exit_codes_and_known_strings() -> None:
+    assert proxyapi.result_is_error("[exit code: 1]\nFAILED tests/test_x.py") is True
+    assert proxyapi.result_is_error("Error: boom") is True
+    assert proxyapi.result_is_error('permission denied: cannot open file') is True
+    assert proxyapi.result_is_error("2\nEXITCODE=0") is False
+    assert proxyapi.result_is_error("") is False
+    assert proxyapi.result_is_error("我这就去读图") is False
+
+
+def _failing_image_call(index: int) -> list[dict]:
+    args = json.dumps({"path": "x.png"})
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": f"c{index}", "type": "function", "function": {"name": "read_image", "arguments": args}}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": f"c{index}",
+            "content": 'Error: cannot read "x.png" as an image: model "pciso" does not declare image input',
+        },
+    ]
+
+
+def test_a_tool_that_keeps_failing_is_reported_as_a_loop() -> None:
+    messages: list[dict] = [SYSTEM, {"role": "user", "content": "干活"}]
+    for i in range(3):
+        messages.extend(_failing_image_call(i))
+    report = proxyapi.loop_report(messages)
+    assert report["failing"] == [
+        ("read_image", 3, 'Error: cannot read "x.png" as an image: model "pciso" does not declare image input')
+    ]
+    assert report["repeated"], "同一组调用连发三次也算循环"
+    assert report["ok"] == 0
+    text = proxyapi.loop_warning(report)
+    assert "【循环告警】" in text
+    assert "read_image" in text
+    assert "不要再调用它" in text
+
+
+def test_planning_without_acting_raises_the_stall_warning() -> None:
+    messages: list[dict] = [SYSTEM, {"role": "user", "content": "干活"}]
+    for i in range(4):
+        messages.append({"role": "assistant", "content": f"第 {i} 步我这就去读文件"})
+    report = proxyapi.loop_report(messages)
+    assert report["plan_only_steps"] == 4
+    text = proxyapi.loop_warning(report)
+    assert "【停滞告警】" in text
+    assert "不要写计划" in text
+
+
+def test_a_working_agent_gets_no_warning() -> None:
+    messages: list[dict] = [SYSTEM, {"role": "user", "content": "干活"}]
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c9", "type": "function", "function": {"name": "read", "arguments": '{"path":"a.py"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c9", "content": "内容"},
+        ]
+    )
+    assert proxyapi.loop_warning(proxyapi.loop_report(messages)) == ""
+
+
+def test_the_loop_warning_rides_in_the_volatile_block() -> None:
+    messages: list[dict] = [SYSTEM, {"role": "user", "content": "干活"}]
+    for i in range(3):
+        messages.extend(_failing_image_call(i))
+    block = proxyapi.volatile_block(_fake_session(), messages)
+    assert "【循环告警】" in block
+    assert "【事实链】" in block, "C 还在，告警只是加在最前面"
+    assert block.index("【循环告警】") < block.index("【事实链】")

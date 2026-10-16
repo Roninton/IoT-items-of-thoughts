@@ -53,8 +53,10 @@ def test_state_block_excludes_superseded_facts() -> None:
 
 def test_state_block_sections_are_all_present() -> None:
     block = render_state_block(_state())
-    for section in ("【事实链】", "【失败链】", "【当前进度】", "【未解决】", "【约束状态】"):
+    for section in ("【事实链】", "【失败链】", "【未解决】", "【约束状态】"):
         assert section in block
+    # 进度那一行的标题取决于"链上到底有没有工具回执"（`_state()` 里没有 ACT）
+    assert "【自述进度·无工具回执核对】" in block
 
 
 def test_state_mode_prompt_contains_prefix_and_c() -> None:
@@ -162,9 +164,16 @@ def test_verification_line_tracks_the_latest_round_only() -> None:
 
 
 def test_no_act_nodes_means_no_verification_line() -> None:
-    """这轮只回话不落文件 —— 不该凭空冒出一行验证状态。"""
+    """这轮只回话不落文件 —— 不能冒出"已跑测试且通过"那种阳性结论。
+
+    改过口径（原先是干脆不输出这一行）：真机里链上一件真事都没有、模型却把自己写的
+    计划当"当前进度"读了一百多圈。所以现在**要**输出一行，但只输出"0 条物证 + 没被核对过"。
+    """
     state = CompressedState(fact_chain=[FactNode(id="N1", statement="只回了话")])
-    assert "【验证状态】" not in render_state_block(state)
+    line = next(ln for ln in render_state_block(state).splitlines() if "【验证状态】" in ln)
+    assert "0 条物证" in line
+    assert "没有任何工具回执" in line
+    assert "通过" not in line
 
 
 def test_stateless_mode_prompt_has_neither_history_nor_c() -> None:
@@ -399,3 +408,33 @@ def test_compressor_prompt_carries_the_verifiable_landing_list() -> None:
     assert "空转陈述" in prompt
     # 落盘清单属于**每轮都变**的部分，必须排在固定指令之后（前缀缓存的前提）
     assert prompt.index("真实落盘清单") > prompt.index("可用操作：")
+
+
+def test_progress_is_labelled_as_the_models_own_words_without_any_tool_receipt() -> None:
+    """没有一条 ACT 时，进度行不能顶着"当前进度"这四个字。
+
+    真机（会话 d87b61bb051b4849）：【当前进度】逐字就是模型自己写的计划 ——
+    "本轮打破只规划不执行的僵局：直接并行发 pwsh 列目录 + read_image"，它读到就以为
+    自己已经执行了，转了一百多圈。链上一件真事都没有时，服务端必须这么说。
+    """
+    state = CompressedState(
+        version=1,
+        progress="本轮打破只规划不执行的僵局：直接并行发 pwsh 列目录",
+        fact_chain=[FactNode(id="N1", statement="先读 tools/duration.py", node_kind="think")],
+    )
+    block = render_state_block(state)
+    assert "【自述进度·无工具回执核对】" in block
+    assert "【当前进度】" not in block
+    assert "0 条物证" in block
+
+
+def test_a_verified_round_keeps_the_normal_progress_label() -> None:
+    state = CompressedState(
+        version=2,
+        progress="tools/duration.py 已落盘",
+        fact_chain=[FactNode(id="N1", statement="写入 tools/duration.py（812B）", node_kind="act")],
+    )
+    block = render_state_block(state)
+    assert "【当前进度】" in block
+    assert "【自述进度·无工具回执核对】" not in block
+    assert "0 条物证" not in block

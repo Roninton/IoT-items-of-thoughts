@@ -1,0 +1,25 @@
+# A 组 —— 单次生成（下界：一次能写多少）
+session:
+  project: one_sentence_edit
+  arm: A
+  label: 单次生成（下界）
+  prefix_path: prefixes/one_sentence_edit
+  fake_oracle: one_sentence_edit
+  max_rounds: 1
+  c_max_tokens: 2000
+  max_total_tokens: 3000000
+  prefix_frozen: true
+  workspace_path: ../drawing-video-toolchain
+compression:
+  # 注意：必须带引号。YAML 1.1 会把未加引号的 off 解析成布尔 False。
+  mode: "off"
+  model: heuristic
+work_model:
+  endpoint: openai
+  model: deepseek-flash   # 以 /v1/models 实测为准
+  thinking: true          # 按设计原文「工作模型 thinking 开」；实测 8000 不够（思考吃满、正文为空）
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

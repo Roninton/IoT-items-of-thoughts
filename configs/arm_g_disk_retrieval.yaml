@@ -1,0 +1,41 @@
+# G 组 —— 磁盘检索形态（"普通 agent 模式"的诚实替身）
+#
+# 工作模型看不到历史、也看不到 C。唯一的信息来源是工作区清单 + @@READ 现读的文件内容。
+# 读取由 server 执行，所以三类失败可审计：
+#   - 无效检索：申请了不存在的路径
+#   - 冗余检索：重读已经给过它的文件
+#   - 检索上下文成本：读了多少字节
+#
+# 与 F 组的差别只有一处：F 连清单都没有，G 有清单且能读。
+# 这一组是"上下文里的精炼记忆 vs 磁盘检索"这个论断的直接对照。
+#
+# 注意：本组没有 harness 自动压缩 —— 一旦引入第二个摘要器就是双机制打架，
+# 压缩时机就不再是配置的函数。
+session:
+  project: one_sentence_edit
+  arm: G
+  label: 磁盘检索（无历史无 C，P + 清单 + @@READ）
+  prefix_path: prefixes/one_sentence_edit
+  c_max_tokens: 2000
+  max_total_tokens: 3000000
+  fake_oracle: one_sentence_edit
+  max_rounds: 8
+  prefix_frozen: true
+  stateless: true
+  workspace_path: ../drawing-video-toolchain
+compression:
+  mode: "off"
+  model: heuristic
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true          # 按设计原文「工作模型 thinking 开」；实测 8000 不够（思考吃满、正文为空）
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+  retrieval: true
+  retrieval_max_cycles: 2
+  retrieval_max_files: 8
+  retrieval_max_bytes: 60000
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

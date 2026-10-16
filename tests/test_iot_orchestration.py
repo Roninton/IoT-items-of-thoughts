@@ -257,3 +257,34 @@ def test_an_orchestrated_round_has_the_shape_metrics_reads(session) -> None:
     assert metrics["per_round"][0]["c_tokens"] > 0
     assert metrics["per_round"][1]["files_written"] == 0  # 编排轮次不走落盘校验
     assert session.state().version == 2  # C 前进了两格
+
+
+# --------------------------------------------------------------------------- #
+# 工具报错 → 失败链 + [否掉] 负节点（报错不能只活在这一轮的消息里）
+# --------------------------------------------------------------------------- #
+
+
+def test_a_failing_tool_becomes_a_failure_and_a_negative_node(session) -> None:
+    out = session.absorb_tool_failures(
+        errors=[("read_image", 3, 'Error: cannot read "x.png" as an image')]
+    )
+    assert out["error_nodes"] == 1
+    record = session.store.last_round()
+    assert record["kind"] == "tool_errors"
+    assert record["judgement"] == "accept"
+    state = session.state()
+    assert state.failure_chain[0].attempt == "调用 read_image"
+    assert state.failure_chain[0].source == "tool"
+    node = state.fact_chain[0]
+    assert node.node_kind == "think"
+    assert node.polarity == "-"
+    assert "不再调用 read_image" in node.statement
+    assert "连续 3 次报错" in node.why
+    # /metrics 与 /state 读得动这条编排轮次（硬读 judgement/violations/usage）
+    assert session.metrics()["per_round"][0]["round"] == 1
+    assert session.state().version == 1
+
+
+def test_no_tool_errors_records_nothing(session) -> None:
+    assert session.absorb_tool_failures() == {"error_nodes": 0}
+    assert session.store.round_index() == 0

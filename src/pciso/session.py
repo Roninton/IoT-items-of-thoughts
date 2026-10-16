@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .actnodes import (
+    build_tool_error_ops,
     describe_verification,
     filter_think_ops,
     item_line,
@@ -1572,6 +1573,56 @@ class Session:
             note="",
         )
         return {"round_index": index + 1, "c_tokens": state_new.est_tokens, **act_stats}
+
+    def absorb_tool_failures(
+        self,
+        *,
+        errors: Sequence[tuple[str, int, str]] = (),
+        workspace: Path | None = None,
+        source: str = "proxy",
+    ) -> dict[str, Any]:
+        """工具报错 → 失败链 + 一条 `[否掉]` 负节点（**零模型调用**）。
+
+        报错只活在当轮的消息里，一被吸收就没了 —— 于是模型没有现实回执可读，只能重复
+        写"我这就去读图"，转了一百多圈。`errors` = `(调用标签, 连续次数, 最近一次报错原文)`。
+        """
+        if not errors:
+            return {"error_nodes": 0}
+        prior = self.state()
+        index = self.store.round_index()
+        ops = build_tool_error_ops(prior_state=prior, errors=errors)
+        if not ops:
+            return {"error_nodes": 0}
+        delta = DeltaC(ops=ops, model="server")
+        state_new, report = apply_delta(
+            prior,
+            delta,
+            round_index=index + 1,
+            c_max_tokens=0,
+            constraint_texts=self.prefix.constraint_texts(),
+            est_tokens_fn=_est_c_tokens,
+        )
+        state_new.est_tokens = _est_c_tokens(state_new)
+        telemetry: dict[str, Any] = {
+            "source": source,
+            "kind": "tool_errors",
+            "error_nodes": len(ops) // 2,
+            "anchors": resolve_anchors(workspace or self.store.workspace, state_new),
+        }
+        self._append_orchestrated_round(
+            kind="tool_errors",
+            index=index,
+            state_new=state_new,
+            delta=delta,
+            report=report,
+            telemetry=telemetry,
+            note="",
+        )
+        return {
+            "round_index": index + 1,
+            "error_nodes": len(ops) // 2,
+            "c_tokens": state_new.est_tokens,
+        }
 
     def _append_orchestrated_round(
         self,

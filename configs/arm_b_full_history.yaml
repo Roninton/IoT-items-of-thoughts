@@ -1,0 +1,27 @@
+# B 组 —— Self-Refine 全历史（迭代本身有无增益）
+#
+# P + 全部历史原文，无压缩。这是最经典的迭代基线。
+# prompt 会随轮数线性增长（实测 2327 -> 约 10k+），是本组最重要的成本特征。
+session:
+  project: one_sentence_edit
+  arm: B
+  label: Self-Refine 全历史（P + 全部历史，无压缩）
+  prefix_path: prefixes/one_sentence_edit
+  c_max_tokens: 2000
+  max_total_tokens: 3000000
+  fake_oracle: one_sentence_edit
+  max_rounds: 8
+  prefix_frozen: true
+  workspace_path: ../drawing-video-toolchain
+compression:
+  mode: "off"
+  model: heuristic
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true          # 按设计原文「工作模型 thinking 开」；实测 8000 不够（思考吃满、正文为空）
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

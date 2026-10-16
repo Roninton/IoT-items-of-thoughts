@@ -224,6 +224,29 @@ def test_think_node_without_an_anchor_is_kept_as_anchorless() -> None:
     assert stats["think_dropped_unanchored"] == 0
 
 
+def test_an_absolute_allowed_path_keeps_a_relative_anchor() -> None:
+    """工具报的是绝对路径、模型写的是相对路径 —— 这是同一个文件，不能判成"编路径"。
+
+    真机（IoT 代理接 DSH）：DSH 传 `D:\\_playground\\workspace\\arms\\probe\\ok.txt`，
+    模型写 `arms/probe/ok.txt`，字符串精确比较不相等 → 整块思考被丢（298 轮 kept=0、
+    dropped_unanchored=27）。
+    """
+    from pciso.actnodes import filter_think_ops, path_matches
+
+    allowed = [r"D:\_playground\workspace\oneline\out\frame.png"]
+    assert path_matches("oneline/out/frame.png", allowed) is True
+    assert path_matches("out/frame.png", allowed) is True  # 后缀命中（按路径边界）
+    assert path_matches("other/frame.png", allowed) is False  # 不是路径边界
+    assert path_matches("toneline/out/frame.png", allowed) is False
+    kept, stats = filter_think_ops(
+        [_think_op("先确认帧图是纯像素再比", path="oneline/out/frame.png")],
+        allowed_paths=allowed,
+    )
+    assert len(kept) == 1
+    assert stats["think_dropped_unanchored"] == 0
+    assert stats["think_kept"] == 1
+
+
 def test_think_node_on_a_path_without_any_real_action_is_dropped() -> None:
     kept, stats = filter_think_ops(
         [_think_op("打算新建 tools/palette.py 存颜色常量", path="tools/palette.py")],

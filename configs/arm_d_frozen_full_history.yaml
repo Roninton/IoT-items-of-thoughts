@@ -1,0 +1,37 @@
+# D 组 —— P 漂出上下文（原设计里这一组是无效的，已重新定义）
+#
+# 原设计把 D 写成「P 冻结 + 完整历史」，用来"隔离 P 冻结这个变量"。
+# 但离线矩阵一跑就暴露了：在"每轮重新发送整个 prompt"的形态下，
+# 「P 冻结 + 完整历史」与 B「Self-Refine 全历史」的**内容完全相同**，
+# 只差 API 侧的前缀缓存命中率 —— 那是成本项，不是可观察内容项。
+# 原样保留只会得到两条重合的曲线（一个假对照组）。
+#
+# 所以把 D 重新定义成真正能隔离出东西的那一组：
+#   P 只在第 1 轮出现，之后靠历史携带 —— 模拟"需求早已滑出上下文窗口"。
+# 这直接测一个很实际的失效模式：当 P 不再被重述时，模型还能否守住约束？
+# 它同时是 C 组的反向对照：C 花 token 每轮重述一份**精炼**的 P+C，
+# D 省掉 P，却指望历史能顶住。
+session:
+  project: one_sentence_edit
+  arm: D
+  label: P 漂出上下文（P 仅第 1 轮，之后只有完整历史）
+  prefix_path: prefixes/one_sentence_edit
+  c_max_tokens: 2000
+  max_total_tokens: 3000000
+  fake_oracle: one_sentence_edit
+  max_rounds: 8
+  # 只在第 1 轮渲染 P；之后不再重述
+  prefix_frozen: false
+  workspace_path: ../drawing-video-toolchain
+compression:
+  mode: "off"
+  model: heuristic
+work_model:
+  endpoint: openai
+  model: deepseek-flash
+  thinking: true          # 按设计原文「工作模型 thinking 开」；实测 8000 不够（思考吃满、正文为空）
+  max_tokens: 32000         # 思考也吃这个预算；8000 实测不够
+validator:
+  tests: run_on_each_round
+  docs: check_coverage
+  constraints: check_list

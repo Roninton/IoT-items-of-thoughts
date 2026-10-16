@@ -108,7 +108,12 @@ def render_state_block(state: CompressedState) -> str:
     for x in state.failure_chain:
         lines.append(f"  - {x.id} 试{x.attempt}：因{x.reason}否决 (轮{x.round})")
 
-    lines.append(f"【当前进度】{state.progress or '（空）'}")
+    # 【当前进度】只认**有工具回执**的进度。一条 ACT 都没有时，progress 里每一句都只是
+    # 模型自述 —— 真机事故：进度行被"本轮判定必须打破僵局、直接并行发 pwsh + read_image"
+    # 占了 70 轮，模型每轮读到的是"我已决定执行"，于是执行本身变得不必要（计划被执行化）。
+    acts = sum(1 for f in state.fact_chain if f.node_kind == "act")
+    label = "【当前进度】" if acts else "【自述进度·无工具回执核对】"
+    lines.append(f"{label}{state.progress or '（空）'}")
 
     # 验证状态**集中成一行**（真机自述：「决定层够用，状态层略薄 —— 验证状态散在几条节点里」）。
     # 这一行是**推导出来的**，不占 C 的存储、不花模型调用、也不会过期：
@@ -116,6 +121,8 @@ def render_state_block(state: CompressedState) -> str:
     status = _verification_line(state)
     if status:
         lines.append(status)
+    elif not acts:
+        lines.append("【验证状态】0 条物证 —— 链上没有任何工具回执，上面的进度与结论都没有被核对过")
 
     lines.append("【未解决】")
     if not state.unresolved:

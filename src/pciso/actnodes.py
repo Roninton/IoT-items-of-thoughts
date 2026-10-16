@@ -208,6 +208,75 @@ def think_anchor_paths(prior_state: CompressedState, written: Sequence[tuple[str
     return paths
 
 
+def _norm_rel(path: str) -> str:
+    """路径归一化：反斜杠→正斜杠、剥掉前导 `./`、去掉尾部斜杠（大小写留给比较时处理）。"""
+    s = str(path or "").replace("\\", "/").strip()
+    while s.startswith("./"):
+        s = s[2:]
+    return s.rstrip("/")
+
+
+def path_matches(anchor: str, allowed: Sequence[str]) -> bool:
+    """锚点算不算「真实动作里出现过」。
+
+    真机事故：DSH 传的路径是绝对的（`D:\\_playground\\workspace\\oneline\\out\\x.png`），
+    模型写的 anchor 是相对的（`oneline/out/x.png`）—— 字符串不相等就被判「编路径」，
+    一整块思考 27 条节点全丢、`kept=0`。所以比较必须归一化，并允许**后缀**匹配：
+    同一根下的同一段后缀，就是同一个文件。
+    """
+    a = _norm_rel(anchor).lower()
+    if not a:
+        return False
+    for cand in allowed:
+        c = _norm_rel(cand).lower()
+        if not c:
+            continue
+        if a == c or c.endswith("/" + a) or a.endswith("/" + c):
+            return True
+    return False
+
+
+def build_tool_error_ops(
+    *,
+    prior_state: CompressedState,
+    errors: Sequence[tuple[str, int, str]],
+    reserved_ids: Sequence[str] = (),
+    max_nodes: int = 2,
+) -> list[DeltaOp]:
+    """工具**报错**进链：一条失败链条目 + 一条 `[否掉]` 负节点（零模型调用）。
+
+    真机事故：`read_image` 每一步都返回同一句
+    `Error: ... model "pciso" does not declare image input`，但这句只活在当轮的消息里 ——
+    一被吸收就没了。模型没有现实回执可读，只能一遍遍写「我这就去读图」，转了一百多圈。
+    报错必须是链上的**长期事实**：`errors` 是 `(调用标签, 连续次数, 最近一次报错原文)`。
+    """
+    picker = _id_picker(prior_state, reserved_ids)
+    ops: list[DeltaOp] = []
+    for label, count, last in list(errors)[:max_nodes]:
+        reason = f"{label} 连续 {count} 次报错：{(last or '').strip()[:160] or '（无正文）'}"
+        ops.append(
+            DeltaOp(
+                op="ADD_FAILURE",
+                payload={"attempt": f"调用 {label}", "reason": reason, "source": "tool"},
+            )
+        )
+        ops.append(
+            DeltaOp(
+                op="ADD_FACT",
+                payload={
+                    "id": picker(),
+                    "statement": f"不再调用 {label}（连续 {count} 次报错，这条路当前不可用）",
+                    "node_kind": "think",
+                    "polarity": "-",
+                    "assertion": "settled",
+                    "why": reason,
+                    "salience": 85,
+                },
+            )
+        )
+    return ops
+
+
 def filter_think_ops(
     ops: Sequence[DeltaOp],
     *,
@@ -264,7 +333,7 @@ def filter_think_ops(
             continue
         anchor = payload.get("anchor") or {}
         path = str(anchor.get("path") or "") if isinstance(anchor, dict) else ""
-        if path and path not in allowed:
+        if path and not path_matches(path, allowed):
             # **编路径**才是要拦的：那等于声称动过一个不存在的产物。
             stats["think_dropped_unanchored"] += 1
             continue
