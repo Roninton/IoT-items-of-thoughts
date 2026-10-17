@@ -122,15 +122,19 @@ def test_a_thinking_block_becomes_think_nodes(session) -> None:
     assert node["anchor"]["resolved"] is True  # 盘上真有这个文件
 
 
-def test_a_block_the_orchestrator_keeps_nothing_from_still_gets_one_line(session) -> None:
-    """编排器说"没什么值得留的"（0 条）时，块也必须有一行概述 —— 不能让客户端看到空白。"""
+def test_a_block_the_orchestrator_keeps_nothing_from_has_no_items(session) -> None:
+    """编排器说"没什么值得记的"（0 条）⇒ 空列表；客户端那块**退回原文**（不压缩）。
+
+    别在这儿塞一行"原文摘要"充数：那会把"没提纯"伪装成"提纯过了"
+    （真机现场：英文块被硬截成 `… I alre…`，看着像提纯结果）。
+    """
 
     empty = StubCompressor()
     empty.raw_ops = []  # 编排器返回 {"ops": []}
     session.compressor = empty
     out = session.absorb_thinking_block(RAW, extra_allowed_paths=["tools/duration.py"])
-    assert out["overview"] is True
-    assert out["items"] == ["嗯……先看 tools/duration.py 现在是什么样，还是先写测试？"]
+    assert out["items"] == []
+    assert "overview" not in out
 
 
 def test_item_lines_only_mark_what_needs_marking() -> None:
@@ -149,18 +153,12 @@ def test_item_lines_only_mark_what_needs_marking() -> None:
     assert item_line(node(node_kind="act", polarity="")) == "[落地] 先写实现再补测试"
 
 
-def test_one_line_overview_takes_the_first_real_sentence() -> None:
-    from pciso.actnodes import one_line_overview
+def test_one_line_overview_is_gone() -> None:
+    """兜底概述已被撤掉（用户裁定：0 条就退回不压缩），别有人再把它加回来。"""
 
-    assert one_line_overview("先看一遍 tools/duration.py 现在长什么样？然后再决定。") == (
-        "先看一遍 tools/duration.py 现在长什么样？"
-    )
-    # 没有够长的句子时，整段压成一行；空白折叠；超长截断
-    assert one_line_overview("  多  空格\n换行  ") == "多 空格 换行"
-    long_text = "开头" + "很长的内容" * 40
-    assert one_line_overview(long_text).endswith("…")
-    assert len(one_line_overview(long_text)) == 121
-    assert one_line_overview("") == ""
+    import pciso.actnodes as actnodes
+
+    assert not hasattr(actnodes, "one_line_overview")
 
 
 def test_the_compressor_gets_the_thinking_and_nothing_else(session) -> None:

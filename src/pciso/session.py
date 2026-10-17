@@ -36,7 +36,6 @@ from .actnodes import (
     describe_verification,
     filter_think_ops,
     item_line,
-    one_line_overview,
     think_anchor_paths,
     with_act_nodes,
 )
@@ -1497,20 +1496,14 @@ class Session:
             for n in state_new.fact_chain
             if n.source_round == index + 1 and n.node_kind in ("think", "act")
         ]
-        # 块级替换的底线：每一块都要有一行紧凑版。编排器说"没什么值得留的"时，
-        # 由服务端从原文抽一句概述补上（零模型调用）——否则客户端那一块就是空白。
-        overview = False
-        if not items:
-            line = one_line_overview(thinking)
-            if line:
-                items = [line]
-                overview = True
+        # 一条都没留下（编排器判"没什么值得记的"，或全被闸门挡掉）⇒ 空列表。
+        # 客户端那一块就**退回原文**（不压缩），见 `proxyapi.emit_compact`：
+        # 宁可让那一块保持原文，也不要塞一行加工过的原文装作提纯过。
         return {
             "compressed": True,
             "round_index": index + 1,
             "ops": len(delta.ops),
             "items": items,
-            "overview": overview,
             "error": delta.error,
             "retried": delta.retried,
             "c_tokens": state_new.est_tokens,

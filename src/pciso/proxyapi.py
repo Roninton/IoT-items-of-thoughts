@@ -572,7 +572,8 @@ def flush_thinking(
         retried=result.get("retried"),
         think_kept=result.get("think_kept"),
         act_nodes=result.get("act_nodes"),
-        overview=result.get("overview"),
+        # 一条都没留 ⇒ 客户端那块退回原文（不压缩）。这个标记是给审计用的。
+        raw_fallback=not items,
         c_tokens=result.get("c_tokens"),
         chars=len(block),
         item_chars=sum(len(x) for x in items),
@@ -1133,8 +1134,10 @@ async def chat_completions(request: Request) -> Any:
             if state.get("error") or not state:
                 # 编排失败（上游报错/超时/没拿到结果）：宁可回原文，也不静默吞掉一段思考。
                 return block
-            # 编排成功但一条都没留：这段思考本来就没有值得留的东西 —— 那就什么都不发。
-            return (state.get("items_text") or "").strip()
+            # 编排成功但一条都没留：**退回不压缩** —— 原文照发，不加工也不截断。
+            # 截断过的原文比原文更像失真（真机见过：英文块没有 。！？ 可切，被硬截成
+            # `… I alre…`，读起来像提纯结果，其实只是把一句话切了一半）。
+            return (state.get("items_text") or "").strip() or block
 
         def forward(raw: bytes) -> list[bytes]:
             """转发的字节：剥掉思考字段、攒够一个完整事件再发、[DONE] 留着由收口发。"""

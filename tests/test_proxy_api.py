@@ -382,8 +382,12 @@ def test_a_failing_upstream_stream_reports_the_reason(client, monkeypatch) -> No
     assert resp.text.rstrip().endswith("data: [DONE]")
 
 
-def test_a_block_with_nothing_to_keep_is_not_re_sent_as_raw(client, monkeypatch) -> None:
-    """编排成功但一条都没留 → 这一块不发 thinking（原文只在"编排失败"时才回退）。"""
+def test_a_block_with_nothing_to_keep_falls_back_to_the_original(client, monkeypatch) -> None:
+    """编排成功但一条都没留 → **退回不压缩**：那一块原文照发，不加工、不截断。
+
+    为什么不发原文截断版：真机遇到过英文块（没有 `。！？` 可切）被硬截成 `… I alre…`，
+    读起来像"提纯结果"，其实是把一句话切了一半 —— 比直接不压更像失真。
+    """
 
     def empty(session, block, *, turn_paths=(), root=None):
         return {"ops": 0, "items_text": "", "error": None}
@@ -399,7 +403,7 @@ def test_a_block_with_nothing_to_keep_is_not_re_sent_as_raw(client, monkeypatch)
         "/v1/chat/completions",
         json={"model": "pciso", "stream": True, "messages": [SYSTEM, {"role": "user", "content": "干活"}]},
     )
-    assert "reasoning_content" not in resp.text
+    assert RAW_THINKING in resp.text  # 原文原样返回（未压缩）
     assert "正文" in resp.text
 
 

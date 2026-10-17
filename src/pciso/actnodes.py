@@ -462,31 +462,6 @@ def is_grounded(statement: str, source: str) -> bool:
     return any(t in source for t in tokens)
 
 
-OVERVIEW_MAX_CHARS = 120
-
-
-def one_line_overview(thinking: str, *, limit: int = OVERVIEW_MAX_CHARS) -> str:
-    """从原始 thinking 里抽一句当**概述**（服务端兜底，零模型调用）。
-
-    为什么要它：编排器对短块常常返回 `{"ops": []}`（"没什么值得留的"），于是这一块就没有
-    紧凑版 —— 客户端要么看到原文、要么什么都看不到。块级替换的语义是"客户端看到的那块就是
-    紧凑版"，所以每块至少要有一行；这一行由服务端从原文里抽，不额外花钱、也绝不把原文整段发出去。
-    """
-
-    text = " ".join((thinking or "").split())
-    if not text:
-        return ""
-    piece = text
-    for match in _SENT_END_RE.finditer(text):
-        candidate = text[: match.end()].strip()
-        if len(candidate) >= 12:
-            piece = candidate
-            break
-    if len(piece) <= limit:
-        return piece
-    return piece[:limit].rstrip() + "…"
-
-
 def item_line(node: FactNode) -> str:
     """一条节点在**客户端面板**里的读法（块级替换后的那一行）。
 
