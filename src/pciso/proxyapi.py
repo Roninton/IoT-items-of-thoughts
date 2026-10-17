@@ -470,11 +470,44 @@ def _report_tool_errors(
 # --------------------------------------------------------------------------- #
 
 
+_CMD_TOOL_RE = re.compile(r"pwsh|bash|shell|terminal|exec|command|^run|_run", re.IGNORECASE)
+_CMD_ARG_KEYS = ("command", "cmd", "script", "input", "args")
+
+
+def _command_with_exit(step: dict[str, Any]) -> tuple[str, int | None] | None:
+    """工具调用如果是"跑命令"，返回 `(命令文本, 退出码)`（退出码取 `[exit code: N]`）。
+
+    为什么单拎出来：ACT 原来只认"写文件"，于是「pytest 跑过了」既没有 ACT 可挂、
+    又会被"禁完成态断言"挡掉 —— 一条真事实两头落空（真机：`think_dropped_claim`）。
+    """
+    if not _CMD_TOOL_RE.search(str(step.get("name") or "")):
+        return None
+    try:
+        args = json.loads(str(step.get("args") or "{}"))
+    except ValueError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    cmd = next(
+        (
+            str(args[key])
+            for key in _CMD_ARG_KEYS
+            if isinstance(args.get(key), str) and str(args[key]).strip()
+        ),
+        "",
+    )
+    if not cmd.strip():
+        return None
+    match = _EXIT_RE.search(str(step.get("result") or ""))
+    return cmd.strip(), (int(match.group(1)) if match else None)
+
+
 def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """把这一轮**新出现**的工具调用（有结果、盘上真有文件）记成 ACT 节点。
+    """把这一轮**新出现**的工具调用（有结果、盘上真有文件 / 有退出码）记成 ACT 节点。
 
     返回里带 `paths`：这一轮工具点过名的所有路径 —— 思考编排用它当"允许挂的锚点"
     （第一个 thinking 块落地时还没有任何 ACT，只认真写过的会让它全军覆没）。
+    跑过的命令也记 ACT（带退出码），否则"测试过了"这类结论没有任何落点。
     """
     meta = session.store.read_meta()
     done = {str(x) for x in (meta.get("proxy_tools_done") or [])}
@@ -493,15 +526,22 @@ def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str
             continue
         fresh.append((call_id, path))
 
-    out: dict[str, Any] = {"paths": turn_paths, "act_nodes": 0, "fresh": len(fresh)}
-    if fresh:
+    trail = tool_trail(messages)
+    fresh_calls = [s for s in trail if s["id"] and s["id"] not in done and s.get("result")]
+    commands = [pair for step in fresh_calls for pair in [_command_with_exit(step)] if pair]
+
+    out: dict[str, Any] = {"paths": turn_paths, "act_nodes": 0, "fresh": len(fresh_calls)}
+    if fresh or commands:
         triples = _written_triples(root, [p for _, p in fresh])
         verify, verify_state = _verify_from(list(results.values()))
         out["written"] = [t[0] for t in triples]
-        if triples:
+        if commands:
+            out["commands"] = len(commands)
+        if triples or commands:
             out.update(
                 session.absorb_actions(
                     written=triples,
+                    commands=commands,
                     sources=_read_sources(root, [p for _, p in fresh]),
                     verify=verify,
                     verify_state=verify_state,
@@ -509,7 +549,9 @@ def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str
                 )
             )
         session.store.patch_meta(
-            proxy_tools_done=[*list(done), *(cid for cid, _ in fresh)][-TOOLS_DONE_MAX:]
+            proxy_tools_done=[*list(done), *(str(s["id"]) for s in fresh_calls)][
+                -TOOLS_DONE_MAX:
+            ]
         )
     errors = _report_tool_errors(session, messages, meta)
     if errors:

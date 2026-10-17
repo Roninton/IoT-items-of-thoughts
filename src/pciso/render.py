@@ -151,6 +151,9 @@ def render_state_block(state: CompressedState) -> str:
 
 _HARD_CACHE: set[str] = set()
 
+# ACT 节点里的退出码（`运行 \`pytest -q\`（exit=0）`，由 `actnodes.build_command_ops` 写）。
+_EXIT_CODE_RE = re.compile(r"exit=(-?\d+)")
+
 
 def _verification_line(state: CompressedState) -> str:
     """把"最近一轮的物证有没有被运行验证过"汇成一行。
@@ -165,9 +168,10 @@ def _verification_line(state: CompressedState) -> str:
     latest = max(f.source_round for f in acts)
     rows = [f for f in acts if f.source_round == latest]
     ids = "、".join(f.id for f in rows)
-    if any("测试通过" in f.statement for f in rows):
+    codes = [m.group(1) for f in rows for m in _EXIT_CODE_RE.finditer(f.statement)]
+    if any("测试通过" in f.statement for f in rows) or (codes and all(c == "0" for c in codes)):
         verdict = "已跑测试且通过"
-    elif any("测试未通过" in f.statement for f in rows):
+    elif any("测试未通过" in f.statement for f in rows) or any(c != "0" for c in codes):
         verdict = "已跑测试但未通过"
     else:
         verdict = "未跑测试（只有静态检查，没有任何运行结论）"

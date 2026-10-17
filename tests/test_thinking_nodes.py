@@ -256,6 +256,48 @@ def test_think_node_on_a_path_without_any_real_action_is_dropped() -> None:
     assert stats["think_dropped_unanchored"] == 1
 
 
+def test_a_path_that_really_exists_on_disk_is_not_a_fabrication(tmp_path) -> None:
+    """锚点指向"这轮没写过、但盘上真有"的文件 —— 不是编造，必须留下。
+
+    真机事故（会话 3881a53e1bd84ed1）：58 块里大半因此被判编路径，其中一块 27 条
+    节点全丢、`kept=0`，客户端那块于是退回原文，机制等于没开。
+    """
+
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "duration.py").write_text("x = 1\n", encoding="utf-8")
+    kept, stats = filter_think_ops(
+        [_think_op("duration 的 format_duration 用 divmod 拆小时", path="tools/duration.py")],
+        allowed_paths=["tools/other.py"],
+        root=tmp_path,
+    )
+    assert len(kept) == 1
+    assert stats["think_anchor_real_file"] == 1
+    assert stats["think_dropped_unanchored"] == 0
+
+
+def test_a_file_to_be_created_in_a_real_directory_is_allowed(tmp_path) -> None:
+    """要新建的文件：目录真实存在就不算编造（模型本来就在规划下一步写哪儿）。"""
+    (tmp_path / "oneline").mkdir()
+    kept, stats = filter_think_ops(
+        [_think_op("下一步给 oneline/motion.py 加 --stride", path="oneline/motion.py")],
+        allowed_paths=[],
+        root=tmp_path,
+    )
+    assert len(kept) == 1
+    assert stats["think_anchor_real_file"] == 1
+
+
+def test_a_path_in_a_directory_that_does_not_exist_is_still_dropped(tmp_path) -> None:
+    """连目录都是编的 —— 这才是"编锚点"，照旧丢。"""
+    kept, stats = filter_think_ops(
+        [_think_op("把颜色常量挪到 tools/palette/colors.py", path="tools/palette/colors.py")],
+        allowed_paths=[],
+        root=tmp_path,
+    )
+    assert kept == []
+    assert stats["think_dropped_unanchored"] == 1
+
+
 def test_think_node_claiming_completion_is_dropped() -> None:
     """推理里说"已实现 / 测试通过"是猜测，完成状态只能由 ACT 给出。"""
     kept, stats = filter_think_ops(

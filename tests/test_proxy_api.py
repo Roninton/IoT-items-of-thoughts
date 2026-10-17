@@ -407,6 +407,41 @@ def test_a_block_with_nothing_to_keep_falls_back_to_the_original(client, monkeyp
     assert "正文" in resp.text
 
 
+def test_a_command_tool_call_is_read_with_its_exit_code() -> None:
+    """`pwsh` 这类工具要能认出来：命令文本 + 退出码，ACT 才有东西可记。"""
+    step = proxyapi.tool_trail(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "pwsh",
+                            "arguments": json.dumps({"command": "python -m pytest -q"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "575 passed\n[exit code: 0]"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": json.dumps({"file_path": "a.py"})},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c2", "content": "内容"},
+        ]
+    )
+    assert proxyapi._command_with_exit(step[0]) == ("python -m pytest -q", 0)
+    assert proxyapi._command_with_exit(step[1]) is None  # read 不是跑命令
+
+
 def test_the_upstream_stream_is_read_decoded_not_raw(monkeypatch) -> None:
     """上游要是压了，`iter_raw()` 拿到的是 gzip —— 字面转发就是把 gzip 当 SSE 发（真踩过）。"""
 

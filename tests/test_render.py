@@ -163,6 +163,17 @@ def test_verification_line_tracks_the_latest_round_only() -> None:
     assert "N9" in line and "N7" not in line
 
 
+def test_verification_line_reads_exit_codes_from_command_acts() -> None:
+    """命令 ACT 记的形式是"运行 <命令>（exit=0）"：验证状态要读得懂，不然"跑过了"等于没跑。"""
+    ok = CompressedState(fact_chain=[_act("N11", "运行 `python -m pytest -q`（exit=0）", 2)])
+    line = next(ln for ln in render_state_block(ok).splitlines() if "【验证状态】" in ln)
+    assert "已跑测试且通过" in line and "N11" in line
+
+    bad = CompressedState(fact_chain=[_act("N12", "运行 `python -m pytest -q`（exit=1）", 2)])
+    line = next(ln for ln in render_state_block(bad).splitlines() if "【验证状态】" in ln)
+    assert "已跑测试但未通过" in line
+
+
 def test_no_act_nodes_means_no_verification_line() -> None:
     """这轮只回话不落文件 —— 不能冒出"已跑测试且通过"那种阳性结论。
 

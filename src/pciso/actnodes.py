@@ -29,6 +29,8 @@ COMPLETION_CLAIM_RE = re.compile(
 )
 
 ACT_SALIENCE = 70
+COMMAND_ACT_SALIENCE = 70
+MAX_COMMAND_ACTS = 8
 
 # **元评论**：THINK 节点在议论别的节点（"否掉 N1 的表述方式"、"N2 与 N5 矛盾"）。
 # 提示词里已经写了"不要记你对 C 的评论"，但真机实测（会话 4746898cbe504248）里，
@@ -236,6 +238,30 @@ def path_matches(anchor: str, allowed: Sequence[str]) -> bool:
     return False
 
 
+def _anchor_on_disk(root: Path | None, path: str) -> bool:
+    """这个路径在盘上（文件**或**它所在目录）真的存在吗。
+
+    为什么要放它一马：「这轮没写过的**真实**文件」不是编造 —— 模型讨论 `spec.py` 时
+    它就在仓库里，而且锚点本身不声称任何动作（声称动作的是完成态断言那道闸门）。
+    真机事故（会话 3881a53e1bd84ed1）：58 块里大半被 `think_dropped_unanchored` 打掉，
+    原因只是锚指向"这轮没点过名、但真实存在"的文件，一整块 27 条节点全丢、`kept=0`，
+    客户端那块于是退回原文 —— 机制等于没开。
+
+    真正该拦的是连目录都编出来的路径。
+    """
+    if root is None:
+        return False
+    rel = _norm_rel(path)
+    if not rel:
+        return False
+    try:
+        target = Path(rel)
+        target = target if target.is_absolute() else root / rel
+        return target.exists() or target.parent.exists()
+    except OSError:
+        return False
+
+
 def build_tool_error_ops(
     *,
     prior_state: CompressedState,
@@ -277,12 +303,57 @@ def build_tool_error_ops(
     return ops
 
 
+def build_command_ops(
+    *,
+    prior_state: CompressedState,
+    commands: Sequence[tuple[str, int | None]],
+    reserved_ids: Sequence[str] = (),
+    max_nodes: int = MAX_COMMAND_ACTS,
+) -> list[DeltaOp]:
+    """命令执行 → ACT 节点（服务端确定性，零模型调用）。
+
+    为什么需要它：ACT 原来只认"写文件"。于是「pytest 跑过了」这类结论两头落空 ——
+    进不了 ACT（没有文件可挂），又撞上"禁完成态断言"被丢（`think_dropped_claim`）。
+    真机现场：模型写「motion 子命令已冒烟通过（exit=0）」，被丢掉，C 里既没有证据也没结论。
+    命令 + 退出码是工具回执里现成的硬事实，由服务端直接落成 ACT 就行。
+    """
+    picker = _id_picker(prior_state, reserved_ids)
+    existing = {
+        str(f.statement).split("（")[0]: f.id
+        for f in prior_state.fact_chain
+        if f.node_kind == "act" and str(f.statement).startswith("运行 ")
+    }
+    ops: list[DeltaOp] = []
+    seen: set[str] = set()
+    for cmd, code in list(commands)[:max_nodes]:
+        text = " ".join(str(cmd or "").split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        head = text if len(text) <= 160 else text[:157] + "…"
+        statement = f"运行 `{head}`" + (f"（exit={code}）" if code is not None else "")
+        payload: dict[str, object] = {
+            "id": picker(),
+            "statement": statement,
+            "node_kind": "act",
+            "salience": COMMAND_ACT_SALIENCE,
+        }
+        target = existing.get(f"运行 `{head}`")
+        if target:
+            # 同一条命令又跑了一次：退出码以最后一次为准（旧读数不许和新读数并排挂着）。
+            ops.append(DeltaOp(op="SUPERSEDE_FACT", target=target, payload=payload))
+        else:
+            ops.append(DeltaOp(op="ADD_FACT", payload=payload))
+    return ops
+
+
 def filter_think_ops(
     ops: Sequence[DeltaOp],
     *,
     allowed_paths: Sequence[str],
     source: str = "",
     constraint_texts: Sequence[str] = (),
+    root: Path | None = None,
 ) -> tuple[list[DeltaOp], dict[str, int]]:
     """服务端硬规则：**不编锚点** + **禁完成态断言** + **未定/风险/克制必须可溯源**。
 
@@ -315,6 +386,8 @@ def filter_think_ops(
         "think_forced_open": 0,
         # 准入判据（negatives 只留"推不出来"的）：复述 P 的负节点丢掉要能数出来。
         "think_dropped_p_restated": 0,
+        # 锚点指向"盘上真实存在、但这轮没写过"的文件：不算编造，放行并计数。
+        "think_anchor_real_file": 0,
     }
     for op in ops:
         payload = dict(op.payload or {})
@@ -334,9 +407,12 @@ def filter_think_ops(
         anchor = payload.get("anchor") or {}
         path = str(anchor.get("path") or "") if isinstance(anchor, dict) else ""
         if path and not path_matches(path, allowed):
-            # **编路径**才是要拦的：那等于声称动过一个不存在的产物。
-            stats["think_dropped_unanchored"] += 1
-            continue
+            if not _anchor_on_disk(root, path):
+                # **编路径**才是要拦的（连目录都不存在）：那等于声称动过一个不存在的产物。
+                stats["think_dropped_unanchored"] += 1
+                continue
+            # 盘上真有这个文件（或至少这个目录）：不是编造，只是这轮没写过。
+            stats["think_anchor_real_file"] += 1
         if not path:
             # 没锚点**不**丢节点（旧规则"无锚不留"在这里是错的，真机实测）：纯推理
             # ——不碰文件的决策、权衡、风险——本来就没有文件可挂。旧规则把一整块思考的
@@ -1145,7 +1221,14 @@ def with_act_nodes(
         cached_tokens=delta.cached_tokens,
     )
     return merged, {
-        "act_nodes": len(act_ops),
+        # 传进来的 delta 里也可能已经是 ACT（比如"跑过的命令"由 `build_command_ops` 先造好）：
+        # 计数要把它们算上，否则 `act_nodes=0` 会让调用方以为一条都没记。
+        "act_nodes": len(act_ops)
+        + sum(
+            1
+            for op in delta.ops
+            if str((op.payload or {}).get("node_kind") or "") == "act"
+        ),
         "act_verified": verify_state or "none",
         "think_alternatives": len(alt_ops),
         "think_dropped_deps": len(dep_ops),

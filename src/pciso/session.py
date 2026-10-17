@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .actnodes import (
+    build_command_ops,
     build_tool_error_ops,
     describe_verification,
     filter_think_ops,
@@ -1460,6 +1461,8 @@ class Session:
             allowed_paths=allowed,
             source=thinking,
             constraint_texts=[c.text for c in self.prefix.constraints],
+            # 锚点指向盘上真实存在的文件时放行（真机事故：一整块 27 条因"这轮没写过"全丢）。
+            root=workspace or self.store.workspace,
         )
         telemetry.update(think_stats)
         delta, act_stats = with_act_nodes(
@@ -1517,6 +1520,7 @@ class Session:
         *,
         written: Sequence[tuple[str, str, int]] = (),
         sources: dict[str, str] | None = None,
+        commands: Sequence[tuple[str, int | None]] = (),
         verify: str = "",
         verify_state: str = "",
         workspace: Path | None = None,
@@ -1524,15 +1528,18 @@ class Session:
     ) -> dict[str, Any]:
         """工具往返 → ACT 节点（**零模型调用**）。
 
-        "这一轮真的写了哪个文件"只能由 server 说：它的依据是工具结果 + 盘上文件，
-        不是模型的自述。所以这条路一行压缩器都不调。
+        "这一轮真的写了哪个文件 / 真的跑了哪条命令"只能由 server 说：依据是工具结果 +
+        盘上文件 + 退出码，不是模型的自述。所以这条路一行压缩器都不调。
         """
-        if not written:
+        if not written and not commands:
             return {"act_nodes": 0}
         prior = self.state()
         index = self.store.round_index()
         delta, act_stats = with_act_nodes(
-            DeltaC(ops=[], model="server"),
+            DeltaC(
+                ops=build_command_ops(prior_state=prior, commands=commands),
+                model="server",
+            ),
             prior_state=prior,
             written=written,
             sources=sources or {},

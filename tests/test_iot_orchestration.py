@@ -234,6 +234,37 @@ def test_a_tool_call_that_wrote_nothing_records_nothing(session) -> None:
     assert session.store.round_index() == 0
 
 
+def test_a_command_run_becomes_an_act_node(session) -> None:
+    """跑过的命令也是物证（带退出码）。
+
+    ACT 原来只认"写文件"，于是「pytest 跑过了」既没有 ACT 可挂、又会被"禁完成态断言"
+    挡掉 —— 两头落空。退出码是工具回执里现成的硬事实。
+    """
+    out = session.absorb_actions(commands=[("python -m pytest -q", 0)])
+    assert out["act_nodes"] == 1
+    node = session.store.last_round()["c_i"]["fact_chain"][0]
+    assert node["node_kind"] == "act"
+    assert node["statement"] == "运行 `python -m pytest -q`（exit=0）"
+
+
+def test_running_the_same_command_again_supersedes_the_old_node(session) -> None:
+    """同一条命令再跑一次：旧的退出码不许和新的一起挂着。"""
+    session.absorb_actions(commands=[("python -m pytest -q", 1)])
+    session.absorb_actions(commands=[("python -m pytest -q", 0)])
+    chain = session.state().fact_chain
+    active = [f for f in chain if f.status == "active"]
+    assert len(active) == 1
+    assert active[0].statement.endswith("（exit=0）")
+    assert any(f.status == "superseded" for f in chain)
+
+
+def test_a_command_without_an_exit_code_is_still_recorded(session) -> None:
+    out = session.absorb_actions(commands=[("dir /b", None)])
+    assert out["act_nodes"] == 1
+    node = session.store.last_round()["c_i"]["fact_chain"][0]
+    assert node["statement"] == "运行 `dir /b`"
+
+
 def test_actions_do_not_call_the_compressor(session) -> None:
     stub = StubCompressor()
     session.compressor = stub
