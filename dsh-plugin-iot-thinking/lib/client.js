@@ -15,6 +15,7 @@ window.__ModuleLoader__.load({
     const STATUS = "/iot-thinking/api/status";
     const FALLBACK = {
       enabled: true,
+      profile: "full",
       minChars: 400,
       maxChars: 24000,
       maxTokens: 2000,
@@ -23,6 +24,12 @@ window.__ModuleLoader__.load({
       provider: null,
       model: null,
       archive: true,
+    };
+
+    const PROFILE_DEFAULTS = {
+      compact: { maxNodes: 5, maxNeutral: 0 },
+      balanced: { maxNodes: 6, maxNeutral: 0 },
+      full: { maxNodes: 8, maxNeutral: 2 },
     };
 
     const h = react.createElement;
@@ -108,6 +115,24 @@ window.__ModuleLoader__.load({
           )
         ),
         h("div", { style: { height: 10 } }),
+        h("div", { style: row },
+          h("div", null,
+            h("div", { style: label }, "压缩档位"),
+            h("div", { style: hint }, "极简 = 3 标签 / 最高压缩；均衡 = 5 标签；完整 = 8 标签 / 质量优先。切换档位会设置节点上限，仍可手动覆盖（受档位硬上限约束）。")
+          ),
+          h("select", {
+            value: cfg.profile ?? "full",
+            style: { ...input, width: 200 },
+            onChange: (e) => {
+              const profile = e.target.value;
+              set({ profile, ...(PROFILE_DEFAULTS[profile] || {}) });
+            },
+          },
+            h("option", { value: "compact" }, "极简（3 标签 / 高压缩）"),
+            h("option", { value: "balanced" }, "均衡（5 标签）"),
+            h("option", { value: "full" }, "完整（8 标签 / 质量优先）")
+          )
+        ),
         h(NumberRow, { title: "最小压缩字符数", desc: "短于这个长度的 thinking 不压，避免为几句话多调一次模型。", value: cfg.minChars, onChange: (v) => set({ minChars: v ?? 0 }) }),
         h(NumberRow, { title: "最大输入字符数", desc: "超过这个长度的 thinking 直接保留原文，避免压缩调用自己撑爆窗口。", value: cfg.maxChars, onChange: (v) => set({ maxChars: v ?? 24000 }), min: 1 }),
         h(NumberRow, { title: "节点输出上限 (tokens)", desc: "压缩器的 maxTokens；节点通常远小于这个值。", value: cfg.maxTokens, onChange: (v) => set({ maxTokens: v ?? 2000 }), min: 1 }),

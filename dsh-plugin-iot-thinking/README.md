@@ -124,6 +124,22 @@ Settings → Plugins → **IoT 思考压缩**:
 - optional **provider / model** — leave blank to follow the current request's
   route, or set another provider/model registered in DSH.
 
+### 压缩档位（3 / 5 / 8 标签）
+
+设置页的 **压缩档位** 决定标签集合与硬节点上限；档位是预设，`maxNodes` /
+`maxNeutral` 仍可手动覆盖，但不会超过档位硬上限。
+
+| 档位 | 标签 | 目标 / 上限 | 说明 |
+|---|---|---|---|
+| `compact` | `[支持] [反对] [待定]` | 3~4 / 5 | 最接近旧 IoT 的 ~85% 压缩；8 标签会硬归并到这三类 |
+| `balanced` | `[支持] [反对] [待定] [计划] [决定]` | 4~6 / 6 | 保留决定与下一步；`[中性]`→`[支持]`、`[权衡]`→`[决定]`、`[风险]`→`[反对]` |
+| `full` | 8 标签（当前默认） | 4~6 / 8 | 质量优先；`[中性]` 最多 2 条 |
+
+归并是**有损**的：`compact` 把 `[计划]` 并进 `[待定]`、`[决定]`/`[权衡]`/`[中性]`
+并进 `[支持]`、`[风险]` 并进 `[反对]`。要保留“决定了什么 / 下一步”就用 `balanced`
+或 `full`；要极限省 token 才用 `compact`。`thinking-compressed` 事件会记录 `profile`，
+便于按档位统计 `charsIn/charsOut`。
+
 The switch writes:
 
 ```text

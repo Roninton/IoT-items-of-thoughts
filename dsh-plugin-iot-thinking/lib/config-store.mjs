@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 
 export const DEFAULTS = Object.freeze({
   enabled: true,
+  profile: "full",
   minChars: 400,
   maxChars: 24000,
   maxTokens: 2000,
@@ -32,7 +33,12 @@ export function defaultConfigPath() {
 function readJson(path) {
   if (!existsSync(path)) return null;
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    let text = readFileSync(path, "utf8");
+    // Windows PowerShell's `Set-Content -Encoding utf8` writes a BOM. JSON.parse
+    // rejects it, which used to fall back to DEFAULTS and silently overwrite the
+    // user's profile with `full`. Strip the BOM before parsing.
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    return JSON.parse(text);
   } catch {
     return null;
   }

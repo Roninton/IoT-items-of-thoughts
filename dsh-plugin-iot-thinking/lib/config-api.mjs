@@ -5,6 +5,7 @@
 // plus a same-origin fetch from the client half. dsh web binds to 127.0.0.1.
 
 import { tailEvents } from "./ledger.mjs";
+import { PROFILES } from "./think.mjs";
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -47,6 +48,7 @@ function readBody(req) {
 function sanitize(payload) {
   const next = {};
   if (typeof payload.enabled === "boolean") next.enabled = payload.enabled;
+  if (typeof payload.profile === "string" && Object.hasOwn(PROFILES, payload.profile)) next.profile = payload.profile;
   if (Number.isFinite(payload.minChars)) next.minChars = Math.max(0, Math.floor(payload.minChars));
   if (Number.isFinite(payload.maxChars)) next.maxChars = Math.max(1, Math.floor(payload.maxChars));
   if (Number.isFinite(payload.maxTokens)) next.maxTokens = Math.max(1, Math.floor(payload.maxTokens));

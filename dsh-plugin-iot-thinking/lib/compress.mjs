@@ -31,6 +31,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
   const started = Date.now();
   const provider = cfg.provider || options.provider;
   const model = cfg.model || options.model;
+  const profile = cfg.profile ?? "full";
 
   if (!provider || !model) {
     mark("thinking-skipped", { index, reason: "no-route" });
@@ -102,6 +103,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
         index,
         provider,
         model,
+        profile,
         charsIn: text.length,
         charsOut: items.length,
         ms: Date.now() - started,
@@ -117,7 +119,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     return null;
   }
 
-  const first = await run(buildCompressionPrompt(text), 0.2);
+  const first = await run(buildCompressionPrompt(text, { profile }), 0.2);
   if (first.error) {
     mark("thinking-failed", {
       index,
@@ -131,7 +133,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
   }
 
   const firstRawDegenerate = isDegenerateItems(first.output);
-  let items = formatNodes(first.output, { maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
+  let items = formatNodes(first.output, { profile, maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
   let lastFinish = first.finish;
   let retried = false;
 
@@ -145,7 +147,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
       finish: first.finish?.kind,
     });
     retried = true;
-    const second = await run(buildCompressionPrompt(text, { strict: true }), 0.1);
+    const second = await run(buildCompressionPrompt(text, { profile, strict: true }), 0.1);
     let secondRawDegenerate = false;
     if (second.error) {
       mark("thinking-failed", {
@@ -159,7 +161,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
       items = "";
     } else {
       secondRawDegenerate = isDegenerateItems(second.output);
-      items = formatNodes(second.output, { maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
+      items = formatNodes(second.output, { profile, maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
       lastFinish = second.finish;
     }
 
@@ -178,6 +180,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
           index,
           provider,
           model,
+          profile,
           charsIn: text.length,
           charsOut: itemsFallback.length,
           ms: Date.now() - started,
@@ -203,6 +206,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     index,
     provider,
     model,
+    profile,
     charsIn: text.length,
     charsOut: items.length,
     ms: Date.now() - started,

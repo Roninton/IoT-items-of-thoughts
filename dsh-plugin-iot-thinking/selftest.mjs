@@ -343,5 +343,38 @@ await check("退化草稿不调用模型，直接走确定性兜底", async () =
   assert.ok(events.some((entry) => entry.event === "thinking-compressed" && entry.fallback === true));
 });
 
+await check("compact 档位：3 标签提示词 + 8 标签归并", () => {
+  const prompt = buildCompressionPrompt("原始思考", { profile: "compact" });
+  assert.match(prompt, /只输出三类节点/);
+  assert.match(prompt, /目标 3~4 条/);
+  assert.match(prompt, /\[支持\]/);
+  assert.match(prompt, /\[反对\]/);
+  assert.match(prompt, /\[待定\]/);
+  const out = formatNodes("[决定] D\n\n[计划] P\n\n[中性] N\n\n[权衡] T\n\n[风险] R", {
+    profile: "compact",
+    maxNodes: 8,
+    maxNeutral: 2,
+  });
+  assert.deepEqual(
+    out.split("\n\n").map((node) => node.slice(0, 4)),
+    ["[支持]", "[待定]", "[支持]", "[支持]", "[反对]"],
+  );
+  assert.ok(!/\[(决定|计划|中性|权衡|风险)\]/.test(out));
+});
+
+await check("compact 档位：maxNodes 硬上限 5", () => {
+  const input = ["[支持] A", "[支持] B", "[支持] C", "[支持] D", "[支持] E", "[支持] F", "[支持] G"].join("\n\n");
+  const out = formatNodes(input, { profile: "compact", maxNodes: 8, maxNeutral: 2 });
+  assert.equal(out.split("\n\n").length, 5);
+});
+
+await check("balanced 档位：5 标签提示词", () => {
+  const prompt = buildCompressionPrompt("原始思考", { profile: "balanced" });
+  assert.match(prompt, /只输出五类节点/);
+  assert.match(prompt, /\[决定\]/);
+  assert.match(prompt, /\[计划\]/);
+  assert.match(prompt, /目标 4~6 条，最多 6 条/);
+});
+
 console.log(failures === 0 ? "\n全部通过" : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);
