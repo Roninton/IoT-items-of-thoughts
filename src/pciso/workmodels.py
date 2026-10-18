@@ -75,7 +75,7 @@ class ChatResult:
     thinking_fallback: bool = False
     # 思考**原文**。以前只记 `reasoning_chars`（体量），原文直接扔掉 —— 于是
     # "为什么这么改"这唯一的住处没了，压缩器只能从正文里猜因果（plan-as-fact 的来源）。
-    # README §1.3 把压缩范围改成"只压 thinking"，它必须真的被传下去。
+    # `docs/principle.md` §1.3 把压缩范围改成"只压 thinking"，它必须真的被传下去。
     thinking: str = ""
 
 
@@ -206,7 +206,7 @@ class WorkOutput:
     # 它恒为 0 就是"上下文是纯净的"的可核对凭证。源码里保留 `system=` 这个 seam
     # 是为了将来做对照实验，一旦真用了，轨迹里立刻看得出来。
     system_chars: int = 0
-    # thinking **原文**（README §1.3）：压缩范围改成"只压 thinking"之后，它是压缩器唯一的输入。
+    # thinking **原文**（`docs/principle.md` §1.3）：压缩范围改成"只压 thinking"之后，它是压缩器唯一的输入。
     # 默认空 —— 离线假模型没有思考，也不该假装有。
     thinking: str = ""
 

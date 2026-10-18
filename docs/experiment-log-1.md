@@ -1,6 +1,8 @@
-# 实验日志：做过什么、拿到了什么
+# 实验日志 1（pciso 期）：做过什么、拿到了什么
 
-只记「做了什么 → 结果数字」。机制细节与沿革在 [`thinking-compression.md`](thinking-compression.md)。
+只记「做了什么 → 结果数字」。机制细节与沿革在 [`thinking-compression.md`](thinking-compression.md)，
+原理与裁定在 [`principle.md`](principle.md)，平台怎么跑在 [`pciso-platform.md`](pciso-platform.md)。
+下一份日志见 [`experiment-log-2.md`](experiment-log-2.md)（插件期）。
 
 > 仓库是**单一初始提交**：更早的 55 个提交、逐轮轨迹（`state/`）、旧七臂配置
 > （`experiment/configs-archive/`）都留档在盘上，不进版本库。

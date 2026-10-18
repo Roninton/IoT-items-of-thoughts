@@ -96,7 +96,7 @@ def render_state_block(state: CompressedState) -> str:
         mark = ""
         if unresolved_anchor:
             mark = "[符号未见] " if f.anchor.symbol_missing else "[未落地] "
-        # 节点类别要在**正文里**看得见（README §1.3）：读者必须能一眼分清
+        # 节点类别要在**正文里**看得见（`docs/principle.md` §1.3）：读者必须能一眼分清
         # "这是 server 记下的动作事实" / "这是模型压出来的推理" / "这是被否掉的路线"。
         # 分不清的后果是实打实的：推理节点会被当成已完成的事实（plan-as-fact 那类噪声）。
         tag = ""
@@ -667,7 +667,7 @@ def build_thinking_prompt(
     landed: Sequence[str] = (),
     act_units: Sequence[str] = (),
 ) -> str:
-    """**推理编排器**的 prompt（README §1.3）：把一段 thinking 压成关键推理节点链。
+    """**推理编排器**的 prompt（`docs/principle.md` §1.3）：把一段 thinking 压成关键推理节点链。
 
     与 `build_compressor_prompt` 的两处根本差别：
 

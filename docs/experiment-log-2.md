@@ -1,6 +1,8 @@
-# 迭代自评：IoT 的收益在「运行时」，不在「总体积」
+# 实验日志 2（插件期）：IoT 的收益在「运行时」，不在「总体积」
 
-> 这是 [`thinking-compression.md`](thinking-compression.md)（设计与讨论期原稿）**之后的第一轮真机自评**。
+> 这是 [`thinking-compression.md`](thinking-compression.md)（设计与讨论期原稿）**之后的第一轮真机自评**，
+> 也是插件形态（`dsh-plugin-iot-thinking`）下的第一份日志；上一份（pciso 七臂实验）见
+> [`experiment-log-1.md`](experiment-log-1.md)，原理与裁定见 [`principle.md`](principle.md)。
 > 原稿的立场与机制大多仍然成立，但**它论证收益的方式被我上一版读偏了**；本文先纠正这一点，
 > 再列原稿里已经过期的条目。
 >

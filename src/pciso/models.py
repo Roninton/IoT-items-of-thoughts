@@ -114,7 +114,7 @@ class FactNode(BaseModel):
     status: FactStatus = "active"
     superseded_by: str | None = None
     unanchored: bool = False  # 锚点解析失败 / 压缩器未给锚点
-    # 节点类别（README §1.3 的压缩范围裁定）：
+    # 节点类别（`docs/principle.md` §1.3 的压缩范围裁定）：
     #   fact   整轮 O_i 提取出来的事实（七个实验臂的口径）
     #   act    server 从 telemetry 确定性渲染的**动作事实**（谁写了哪个文件、sha、退出码）
     #   think  模型把 thinking 块压出来的**关键推理节点**
@@ -264,7 +264,7 @@ class DeltaC(BaseModel):
 
     不是"O_i 的压缩版"：它是提取出来的事实/失败/依赖操作序列，
     每一条都能被验证（锚点可解析）或被推翻（SUPERSEDE / INVALIDATE）。
-    所以它的质量看**无据声明率与作废正确性**，不看体积比 —— 见 README §1.2。
+    所以它的质量看**无据声明率与作废正确性**，不看体积比 —— 见 `docs/principle.md` §1.2。
     """
 
     ops: list[DeltaOp] = Field(default_factory=list)

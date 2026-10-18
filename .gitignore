@@ -27,7 +27,7 @@ state-rehearsal/
 
 # state/ = 运行数据（逐轮轨迹、快照、thinking 原文、会话注册表）。它按轮数线性涨
 # （20MB+、上千文件），属于**盘上留档**而不是版本库内容；
-# "做了什么实验、拿到什么结果"由 docs/experiment-log.md 承担。
+# "做了什么实验、拿到什么结果"由 docs/experiment-log-1.md 承担。
 state/
 
 # 旧实验配置（七臂 A–G + 冒烟）留档在 experiment/configs-archive/，不进版本库。

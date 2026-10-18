@@ -4,7 +4,7 @@
 （它坐在 O_i 与 C 之间），职责是**从 O_i 里提取事实链**，不是"压缩文本"。
 这两者衡量标准不同（无据声明率 vs 体积比）、失败模式不同（丢事实是**错**，不是有损）、
 并且提取必须区分来源（server 可验证的 vs 模型声称的）。
-完整口径见 README §1.2 —— 按"压缩"的直觉去优化这个组件，方向是错的。
+完整口径见 `docs/principle.md` §1.2 —— 按"压缩"的直觉去优化这个组件，方向是错的。
 
 三种模式（对应实验的 compression 配置）：
   off         不提取 —— 由 history_mode=full 直接拼历史，C 只保留验证器写的约束状态
@@ -481,7 +481,7 @@ class ModelFactChainCompressor:
 
 
 class ThinkingNodeCompressor(ModelFactChainCompressor):
-    """推理编排器：只吃**一个 thinking 块**，产出正负推理节点（README §1.3）。
+    """推理编排器：只吃**一个 thinking 块**，产出正负推理节点（`docs/principle.md` §1.3）。
 
     与父类（整轮 O_i 提取器）的三点不同：
 

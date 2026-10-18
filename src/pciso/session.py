@@ -748,7 +748,7 @@ class Session:
         else:
             out = self.work_model.run(prompt, stage=stage, round_index=index + 1)
             o_i = out.text
-            # 这一轮的 thinking 本体（README §1.3：只有它进推理编排器）。
+            # 这一轮的 thinking 本体（`docs/principle.md` §1.3：只有它进推理编排器）。
             thinking_text = out.thinking or ""
             telemetry["o_i_source"] = "work_model"
             telemetry["work_note"] = out.note

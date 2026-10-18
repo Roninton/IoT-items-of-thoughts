@@ -6,7 +6,8 @@
 这条区分不是措辞：衡量标准不同（无据声明率/锚点可解析率/作废正确性 vs 体积比）、
 失败模式不同（丢事实是**错**，不是有损）、来源必须可区分（server 可验证 vs 模型声称）。
 文档会被后来的人删掉，测试不会 —— 所以口径也要有测试守着：
-口径一旦只写在 README 里，下一个人按"压缩"的直觉去优化它，方向就是错的。
+口径一旦只写在文档里（哪怕就在首页 README），下一个人按"压缩"的直觉去优化它，方向就是错的。
+口径正文在 `docs/principle.md`（首页 README 留摘要并链接过去），所以这两处都要被钉住。
 """
 
 from __future__ import annotations
@@ -60,15 +61,19 @@ def test_prompt_forbids_fabrication_and_requires_anchors() -> None:
     assert "锚点" in text
 
 
-def test_readme_documents_the_ruling_and_its_consequences() -> None:
-    """留档检查：口径与三条后果都必须在 README 里。"""
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "位置名" in readme
-    assert "职责是**事实链提取**" in readme
+def test_principle_doc_documents_the_ruling_and_its_consequences() -> None:
+    """留档检查：口径与三条后果都必须在原理文档里，且首页 README 要能走到它。"""
+    principle = (ROOT / "docs" / "principle.md").read_text(encoding="utf-8")
+    assert "位置名" in principle
+    assert "职责是**事实链提取**" in principle
     for consequence in ("衡量标准不同", "失败模式不同", "来源必须可区分"):
-        assert consequence in readme, consequence
+        assert consequence in principle, consequence
     # 主指标必须是无据声明率，而不是压缩比
-    assert "无据声明率" in readme
+    assert "无据声明率" in principle
+
+    # 口径挪进 docs/ 之后，首页不能失联：README 必须链接到它（否则等于从入口删掉了这条裁定）
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "docs/principle.md" in readme
 
 
 def test_module_and_config_docstrings_carry_the_ruling() -> None:

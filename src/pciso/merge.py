@@ -409,7 +409,7 @@ def _trim_to_budget(state: CompressedState, c_max_tokens: int, est_tokens_fn) ->
         ]
         if not candidates:
             break
-        # **负推理节点有保底**（README §1.3）：它拦住的是"下一轮重新走一遍已经否掉的路"，
+        # **负推理节点有保底**（`docs/principle.md` §1.3）：它拦住的是"下一轮重新走一遍已经否掉的路"，
         # 所以排序键里先按"是不是负节点"分组，负节点只在没有别的东西可丢时才被丢。
         # 第二档保 `assertion == "open"` 的节点：它们是"还没定、下一轮要拍板"的少数几条，
         # 字数极小而价值最高（丢了就会把上一轮的犹豫当成已定结论接着往下走）。

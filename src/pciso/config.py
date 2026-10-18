@@ -17,13 +17,13 @@ class CompressionConfig(BaseModel):
     **键名叫 compression，指的是"坐在 O_i 与 C 之间"这个位置，不是职责。**
     职责是从 O_i 提取事实链：衡量标准是无据声明率/锚点可解析率/作废正确性，不是体积比；
     丢事实是**错**而不是有损；来源（server 可验证 vs 模型声称）必须可区分。
-    完整口径见 README §1.2。
+    完整口径见 `docs/principle.md` §1.2。
     """
 
     mode: CompressionMode = "fact_chain"
     # 提取器后端名，在 models.yaml 里解析；"heuristic"/"fake" = 确定性离线实现
     model: str = "heuristic"
-    # **压缩范围**（README §1.3）：
+    # **压缩范围**（`docs/principle.md` §1.3）：
     #   full      整轮 O_i 进提取器（七个实验臂的口径，默认值 —— 不许动）
     #   thinking  只把 thinking 块压成**关键推理节点**（正/负）；动作事实由 server 从
     #             telemetry 确定性渲染（actnodes.build_act_ops），正文不进 C。
@@ -222,7 +222,7 @@ class SessionConfig(BaseModel):
             "max_rounds": self.max_rounds,
             "compression": self.compression.mode,
             # 压缩**范围**要进实验设置表：full 与 thinking 是两种不同的上下文机制，
-            # 只报 mode 会让两组数据混成一组（README §1.3）。
+            # 只报 mode 会让两组数据混成一组（`docs/principle.md` §1.3）。
             "compression_scope": self.compression.scope,
             "history_mode": self.resolved_history_mode(),
             "prefix_frozen": self.prefix_frozen,
