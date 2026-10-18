@@ -1,0 +1,21 @@
+# dsh bundle patch: IoT thinking-block compression.
+#
+# Installed as a bundle (plugin manager / `dsh plugin add`), this row becomes a
+# layer of the profile's composition automatically. The row name is the package
+# name, so the profile resolves it from its own node_modules.
+#
+# The plugin hooks the `llm/stream` waterfall and rewrites the completed
+# reasoning block in place. It does NOT provide `ctx.compaction`: no
+# `compaction/start` / `compaction/end`, no checkpoint message, no extra
+# "context compacted" block in the conversation.
+- insert:
+    - id: iot-thinking
+      name: 'dsh-plugin-iot-thinking'
+      config:
+        # Defaults only. The live on/off switch and numeric limits are stored in
+        # $DSH_HOME/plugin-data/iot-thinking/config.json and can be changed from
+        # Settings → Plugins → IoT 思考压缩 without restarting dsh.
+        enabled: true
+        minChars: 400
+        maxTokens: 2000
+        archive: true

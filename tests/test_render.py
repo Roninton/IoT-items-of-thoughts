@@ -45,10 +45,20 @@ def _cfg(mode: str, **kw) -> SessionConfig:
     )
 
 
-def test_state_block_excludes_superseded_facts() -> None:
+def test_state_block_keeps_a_tombstone_for_superseded_facts() -> None:
+    """作废节点**留墓碑、不留内容**：位置稳定（前缀缓存），内容不占预算。
+
+    历史口径是"失效节点整行消失"—— 那会从事实链中部挖一个洞，其后每一行整体前移，
+    C 的字节从洞里开始全变（见 `render.render_state_block` 的注释）。
+    所以断言分两半：`[N2]` 的**位置**还在、而且紧跟在 `[N1]` 之后，
+    但它的**陈述内容**仍然不进 prompt。
+    """
     block = render_state_block(_state())
     assert "[N1]" in block
-    assert "[N2]" not in block  # 失效节点不进 prompt
+    assert "[N2]" in block  # 墓碑：位置保住
+    assert "（已作废）" in block
+    assert "旧的" not in block  # 内容仍然不进 prompt
+    assert block.index("[N1]") < block.index("[N2]")
 
 
 def test_state_block_sections_are_all_present() -> None:

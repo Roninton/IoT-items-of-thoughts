@@ -1,0 +1,21 @@
+{
+  "name": "iot-compaction",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH compaction backend: replaces history summarization with IoT thinking extraction (items of thoughts)",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

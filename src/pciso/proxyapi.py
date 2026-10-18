@@ -502,31 +502,48 @@ def _command_with_exit(step: dict[str, Any]) -> tuple[str, int | None] | None:
     return cmd.strip(), (int(match.group(1)) if match else None)
 
 
+def turn_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """**本轮**的消息（最后一条真 user 消息之后）。
+
+    `absorb_actions` 只能看这一段。`proxy_tools_done` 是一本有长度上限的账本
+    （`TOOLS_DONE_MAX`）：历史一长，最老的 `call_id` 就掉出去；若拿**全量** messages
+    去比对账本，那些老调用每个请求都会被重新判成"新动作"，于是在链尾重新生成 ACT、
+    把同路径的现有节点 SUPERSEDE 掉 —— C 里没有任何新事实，字节却每请求都在变
+    （节点从链中部搬到链尾，id 跟着换），前缀缓存被逐请求作废。
+    """
+    start = last_user_index(messages)
+    return list(messages[start:]) if start is not None else list(messages)
+
+
 def absorb_actions(session: Any, messages: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """把这一轮**新出现**的工具调用（有结果、盘上真有文件 / 有退出码）记成 ACT 节点。
 
     返回里带 `paths`：这一轮工具点过名的所有路径 —— 思考编排用它当"允许挂的锚点"
     （第一个 thinking 块落地时还没有任何 ACT，只认真写过的会让它全军覆没）。
     跑过的命令也记 ACT（带退出码），否则"测试过了"这类结论没有任何落点。
+
+    只看**本轮**（`turn_messages`）：更早的历史已由 C 代表，重复扫历史会把掉出账本的
+    老调用重新记账（见 `turn_messages` 的说明）。
     """
     meta = session.store.read_meta()
     done = {str(x) for x in (meta.get("proxy_tools_done") or [])}
+    turn = turn_messages(messages)
     results = {
         str(m.get("tool_call_id") or ""): _text_of(m.get("content"))
-        for m in messages
+        for m in turn
         if m.get("role") == "tool"
     }
     root = workspace_root(session)
     turn_paths: list[str] = []
     fresh: list[tuple[str, str]] = []
-    for call_id, path in write_calls(messages, root):
+    for call_id, path in write_calls(turn, root):
         if path not in turn_paths:
             turn_paths.append(path)
         if not call_id or call_id in done or call_id not in results:
             continue
         fresh.append((call_id, path))
 
-    trail = tool_trail(messages)
+    trail = tool_trail(turn)
     fresh_calls = [s for s in trail if s["id"] and s["id"] not in done and s.get("result")]
     commands = [pair for step in fresh_calls for pair in [_command_with_exit(step)] if pair]
 
@@ -653,15 +670,17 @@ def volatile_block(session: Any, messages: Sequence[dict[str, Any]] = ()) -> str
     这一块变）：插在头部 27.5% → 挂到末尾 91.3% → 完全不带它（上界）98.3%。
     线上低命中那几次的 cached 恰好只剩 ~1920 token（客户端 system + 固定说明），同一个指纹。
     """
-    parts = []
-    warning = loop_warning(loop_report(messages)) if messages else ""
-    if warning:
-        # 循环/停滞是**硬事实**（工具的返回就在上面），放在这块的最前面：它比 C 更急。
-        parts.append(warning)
-    parts.append(render_state_block(session.state()).strip())
+    parts = [render_state_block(session.state()).strip()]
     words = session.user_words()[-USER_WORDS_MAX:]
     if words:
         parts.append(render_user_words(words).strip())
+    warning = loop_warning(loop_report(messages)) if messages else ""
+    if warning:
+        # 循环/停滞是**硬事实**（工具的返回就在上面），但位置必须在**最后**：
+        # 这条告警每步都在"出现 / 消失"之间跳，放在 C 之前会让它后面那一整块
+        # （C + 用户原话）每步重算 —— 一条告警就废掉整块复用。
+        # 挂到末尾既不影响它被看见（离生成最近，recency 反而更强），又只牺牲它自己。
+        parts.append(warning)
     return "\n\n".join(p for p in parts if p)
 
 

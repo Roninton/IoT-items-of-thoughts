@@ -1,0 +1,20 @@
+# iot-compaction 作为 **bundle** 的自带 patch 层（0.2.0 分发形态）。
+#
+# 这份文件由 `package.json` 的 `dsh.bundle.patch` 指向。当本包被装进 profile 并由
+# plugin_manager 的 install_bundle 选中时，这一层会自动叠加，不需要手改 profile 的
+# cordis.patch.yml。entry 的 `name` 用**包名**（模块说明符，相对 profile 解析）。
+#
+# ⚠️ compaction 后端的挂载层是有讲究的：
+#   preset 会话的 compaction 是 entry-local realm（isolate: {compaction: true}），
+#   host 层挂的后端对它们**永不触发**。若要覆盖 preset 会话，必须把这一行放进
+#   该 preset 自己的 plugins 列表（见 deploy/preset-compaction-row.yml）。
+#
+# ⚠️ config 里**只放宿主 compaction-basic 认识的键**。插件自己的开关
+#   （everyStep / requireThinking / thresholdRatio）在代码里有默认值，
+#   不写进行 config —— 宿主会 resolveConfig 校验，未知键是白冒的风险。
+- insert:
+    - id: iot-compaction
+      name: iot-compaction
+      config:
+        maxTokens: 1200
+        retainRatio: 0.12

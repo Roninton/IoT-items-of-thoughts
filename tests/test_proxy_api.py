@@ -595,11 +595,16 @@ def test_a_working_agent_gets_no_warning() -> None:
     assert proxyapi.loop_warning(proxyapi.loop_report(messages)) == ""
 
 
-def test_the_loop_warning_rides_in_the_volatile_block() -> None:
+def test_the_loop_warning_rides_at_the_end_of_the_volatile_block() -> None:
+    """告警挂在 volatile 块的**末尾**：它每步都在"出现 / 消失"之间跳。
+
+    放在 C 之前，一条告警就会废掉它后面那一整块（C + 用户原话）的复用；
+    挂到末尾只牺牲它自己，而且离生成最近（recency 让注意力不降反升）。
+    """
     messages: list[dict] = [SYSTEM, {"role": "user", "content": "干活"}]
     for i in range(3):
         messages.extend(_failing_image_call(i))
     block = proxyapi.volatile_block(_fake_session(), messages)
     assert "【循环告警】" in block
-    assert "【事实链】" in block, "C 还在，告警只是加在最前面"
-    assert block.index("【循环告警】") < block.index("【事实链】")
+    assert "【事实链】" in block, "C 还在，告警只是挪到最后"
+    assert block.index("【事实链】") < block.index("【循环告警】")

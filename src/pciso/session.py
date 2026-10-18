@@ -1182,6 +1182,41 @@ class Session:
             "extra_in_c": sorted(f"{s}->{d}" for s, d in (claimed - actual))[:10],
         }
 
+    def _proxy_cache_stats(self) -> dict[str, Any]:
+        """聚合 `proxy_call` 事件里的真实用量 —— 代理路径**唯一**的用量落点。
+
+        `tokens.work_cached_total` 读的是 `rounds.jsonl`，而代理模式不写 rounds：
+        于是默认链路上"命中率"既没有数、也没有比率，C 的字节每轮都在变这件事
+        在指标里完全看不出来。这里直接聚合事件流，给总输入 / 命中量 / 比率三个数。
+        """
+        calls = 0
+        prompt = 0
+        cached = 0
+        try:
+            events = list(self.store.iter_events())
+        except (OSError, ValueError):
+            events = []
+        for ev in events:
+            if str(ev.get("kind") or "") != "proxy_call":
+                continue
+            usage = ev.get("usage") or {}
+            if not isinstance(usage, dict):
+                continue
+            calls += 1
+            prompt += int(usage.get("prompt_tokens") or 0)
+            details = usage.get("prompt_tokens_details") or {}
+            cached += int(
+                usage.get("prompt_cache_hit_tokens")
+                or (details.get("cached_tokens") if isinstance(details, dict) else 0)
+                or 0
+            )
+        return {
+            "calls": calls,
+            "prompt_tokens": prompt,
+            "cached_tokens": cached,
+            "cached_ratio": (cached / prompt) if prompt else None,
+        }
+
     def metrics(self) -> dict[str, Any]:
         rounds = self.store.read_rounds()
         per_round: list[dict[str, Any]] = []
@@ -1303,10 +1338,17 @@ class Session:
             "tokens": {
                 "work_prompt_total": total_work,
                 "work_cached_total": total_cached,
+                # 命中率必须单独给出来：只记总量的话，"C 的字节每轮都在变"这件事
+                # 在指标里看不出来 —— 而命中率正是这套机制唯一真正的成本项。
+                "work_uncached_total": total_work - total_cached,
+                "work_cached_ratio": (total_cached / total_work) if total_work else None,
                 "work_completion_total": total_completion,
                 "compressor_total": total_comp,
                 "total": total_work + total_completion + total_comp,
             },
+            # 代理模式（默认链路）不写 rounds，用量只落在 proxy_call 事件里；
+            # 不聚合它，命中率在默认链路上永远是 0 / 不可见。
+            "proxy_cache": self._proxy_cache_stats(),
             "compression_quality": {
                 "anchors_checked": checked,
                 "anchors_unresolved": unresolved,

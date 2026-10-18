@@ -1,0 +1,51 @@
+# iot-compaction 挂载行（**放进 preset 的 compaction 组**，不是 host 平面）
+
+把目标 preset 的 `agent.cordis.yml` 里这段：
+
+```yaml
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+  config:
+    - id: compaction-basic          # ← 或 compaction-acp / 任何现有后端
+      name: '@deepseek-ai/dsh-compaction-basic'
+      config: { ... }
+```
+
+改成：
+
+```yaml
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+  config:
+    - id: iot-compaction
+      name: ./plugins/iot-compaction/index.mjs
+      config:
+        maxTokens: 1200        # 单次提纯的输出上限（条目不长）
+        retainRatio: 0.12      # 保留最近 12% 不动，否则刚发生的事也会被压掉
+        everyStep: true        # 每个 step 边界都检查（而不是等上下文快满）
+        requireThinking: true  # 段内没有 thinking 就不压（避免每步白调一次模型）
+```
+
+## 为什么必须是 preset 而不是 profile
+
+preset 会话的 `compaction` 是一个 `cordis:group` + `isolate: {compaction: true}` 的
+**entry-local realm**：会话的 `ctx.compaction` 只解析到 realm 内的那一行。
+挂在 profile（host）层的后端对它**永远不触发** —— 这是
+`harness-evolve/knowledge/harness-debug.md`「上下文压缩(一)」的实证结论。
+
+## 不要直接改 standard-acp
+
+那个 preset 已经挂了 `billion-context-web`（模型驱动的 ACP 压缩），
+同一个 compaction realm **只能有一个后端**。两种做法：
+
+1. **新建一份 preset**（推荐）：复制 `standard`/`standard-acp` 为 `standard-iot`，
+   只替换 compaction 组那一行；`preset.yml` 里改 `id`/`title`；
+2. 或者你确实想让 IoT 取代 billion-context，再直接替换 `compaction-acp` 行。
+
+preset 组是**创建会话时固定**的：换后端只影响新会话，旧会话不受影响。

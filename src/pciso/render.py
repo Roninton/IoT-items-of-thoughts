@@ -56,10 +56,18 @@ def render_state_block(state: CompressedState) -> str:
     lines: list[str] = []
 
     lines.append("【事实链】")
-    facts = state.active_facts()
-    if not facts:
+    # 遍历**全量** fact_chain（不是 active_facts）：作废节点要在原位留一行墓碑。
+    #
+    # 机制漏洞（实测推演，不是猜测）：SUPERSEDE / INVALIDATE 只改 `status`、节点仍留在链里，
+    # 而渲染过去只画 active 的那些 —— 于是**链中部的一行凭空消失**，其后所有行整体前移。
+    # 一个文件被重写一次就在链里挖一个洞，C 的字节从洞那里开始全变，前缀缓存作废。
+    # 留一行定形的「（已作废）」既保住位置，又不假装它还成立。
+    if not state.fact_chain:
         lines.append("  （空）")
-    for f in facts:
+    for f in state.fact_chain:
+        if f.status != "active":
+            lines.append(f"  [{f.id}] （已作废）")
+            continue
         # 锚点没落地（文件不存在）必须**在正文里说出来**。
         #
         # 真机踩过：第 1 轮（"先别动文件"）里模型讲的是**计划**，压缩器把计划记成了事实，
@@ -115,15 +123,6 @@ def render_state_block(state: CompressedState) -> str:
     label = "【当前进度】" if acts else "【自述进度·无工具回执核对】"
     lines.append(f"{label}{state.progress or '（空）'}")
 
-    # 验证状态**集中成一行**（真机自述：「决定层够用，状态层略薄 —— 验证状态散在几条节点里」）。
-    # 这一行是**推导出来的**，不占 C 的存储、不花模型调用、也不会过期：
-    # 内容直接来自最近一轮 ACT 节点自己带的验证小句（那个小句由 server 从 pytest_suite 渲染）。
-    status = _verification_line(state)
-    if status:
-        lines.append(status)
-    elif not acts:
-        lines.append("【验证状态】0 条物证 —— 链上没有任何工具回执，上面的进度与结论都没有被核对过")
-
     lines.append("【未解决】")
     if not state.unresolved:
         lines.append("  （空）")
@@ -145,6 +144,17 @@ def render_state_block(state: CompressedState) -> str:
     if state.summary:
         lines.append("【滚动摘要】")
         lines.append("  " + state.summary.strip().replace("\n", " "))
+
+    # 验证状态**集中成一行**，且**放在最后**。
+    # 这一行是**推导出来的**（来自最近一轮 ACT 自带的验证小句，由 server 从 pytest_suite 渲染），
+    # 不占 C 的存储、不花模型调用、也不会过期；但它**每轮都可能变** ——
+    # 过去它卡在【未解决】之前（也就是 C 的中段），一变就让后面所有段落重算。
+    # 会变的行一律排到末尾，这是 C 这一侧的前缀缓存不变量（与压缩器提示词同一原则）。
+    status = _verification_line(state)
+    if status:
+        lines.append(status)
+    elif not acts:
+        lines.append("【验证状态】0 条物证 —— 链上没有任何工具回执，上面的进度与结论都没有被核对过")
 
     return "\n".join(lines)
 
