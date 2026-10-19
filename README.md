@@ -28,6 +28,8 @@ dsh plugin --profile web add "<repo>\dsh-plugin-iot-thinking"
 #    也可以走 UI：Settings → Plugins → 添加插件 → 填上面那个绝对路径
 #    ⚠️ 填「声明了 dsh.bundle 的那一层」：子目录或仓库根都行（根 package.json 已声明），
 #       但不要填 GitHub 的 /tree/main/... 子目录页地址，那是 invalid-spec
+#    ⚠️ 走 GitHub 地址安装前先看插件 README 的「中国网络」一节：直连 github.com:443
+#       实测会等 109 s 后超时，需要给 git 和 profile 的 .npmrc 都配代理
 #    装完重启一次 dsh web（host 模块是新的；client 半个从 exports["./client"] 出）
 
 # 2) 插件自测（纯逻辑，不启动 dsh、不连模型）

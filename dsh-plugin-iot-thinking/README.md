@@ -104,10 +104,47 @@ thinking-degenerate { stage: "input" | "output", action: "retry" | "fallback" | 
 `这个包没有声明组合包，不能作为插件管理`（装完发现包里没有 `dsh.bundle`，`not-bundle`）、
 `无法识别这个包名或地址`（`tree/...` 这类 URL）。三条都是"填错了那一层"的症状。
 
+### ⚠️ 中国网络：GitHub 地址安装会超时，先配代理
+
+**症状**：UI 里填 GitHub 地址后**等 1~2 分钟**，然后
+`ERR_PNPM_GIT_RESOLVE_FAILED … Failed to connect to github.com:443 after 21078 ms`。
+实测这台机器直连 `github.com:443` **三次全 21 s 超时**，偶尔又能 1.2 s 连通 —— 是链路抖动，不是插件问题。
+
+**为什么给 `HTTPS_PROXY` 没用**：`pnpm add <github-url>` 走的是 **git 协议**，git 不读
+`HTTPS_PROXY`，只认自己的 `http.proxy` 配置。而安装界面里的「安装源」是 **npm registry 地址**，
+GitHub 地址根本不经过它 —— 在那里填代理只会变成另一种失败。
+
+**两步修好**（本机 FlClash 跑在 7890，按自己的端口改）：
+
+```powershell
+# 1) git 走代理（影响所有 git 操作；不想要时 git config --global --unset http.proxy）
+git config --global http.proxy http://127.0.0.1:7890
+git config --global https.proxy http://127.0.0.1:7890
+```
+
+```ini
+# 2) profile 里的 pnpm 走代理：$DSH_HOME/profiles/web/.npmrc
+proxy=http://127.0.0.1:7890
+https-proxy=http://127.0.0.1:7890
+noproxy=localhost,127.0.0.1
+```
+
+`.npmrc` 这条对**界面里的安装同样生效**，且**不用重启 dsh**（pnpm 在 profile 目录里运行，会读它）。
+实测对比：
+
+| 路径 | 耗时 | 结果 |
+|---|---|---|
+| GitHub 地址，无代理 | 109 s | **失败**（21 s 超时） |
+| GitHub 地址，配好上面两步 | 3.2 s | 成功 |
+| 本机目录（零网络） | 0.8 s | 成功 |
+| `ghproxy.net` 镜像 tarball | 2.8 s | 实验时 **502**，不可用 |
+
+**替代方案**：拿不到代理就直接用本机目录（先 clone 一次，或用网盘/U 盘拷仓库），完全不碰网络。
+
 ### From the UI
 
-Settings → Plugins → **添加插件** → enter the absolute path of the **package
-directory** (the repo root is now a valid package too):
+Settings → Plugins → **添加插件** → 填**声明了 `dsh.bundle` 那一层**的绝对路径
+（仓库根现在也是合法包）：
 
 ```text
 D:\_playground\workspace\IoT-items-of-thoughts\dsh-plugin-iot-thinking
