@@ -21,6 +21,13 @@
       "platform": "web"
     }
   },
+  "files": [
+    "dsh-plugin-iot-thinking/index.mjs",
+    "dsh-plugin-iot-thinking/lib/",
+    "dsh-plugin-iot-thinking/cordis.patch.yml",
+    "dsh-plugin-iot-thinking/package.json",
+    "dsh-plugin-iot-thinking/README.md"
+  ],
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2"
   },
