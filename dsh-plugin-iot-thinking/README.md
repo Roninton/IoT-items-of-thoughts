@@ -291,13 +291,23 @@ degenerate input/output detection, strict retry, and deterministic fallback.
 7. **统计压缩率请用 `block-replaced`，不是 `thinking-compressed`。** 后者现在带
    `replaced: true|false`：只有 `true` 的块真的替换了原文。变长的块会被
    `block-kept (reason=not-shorter)` 拦下、原文照旧保留，所以拿 `thinking-compressed`
-   求和仍会低估真实收益。
-8. **Electron 打包版（`app.asar`）不支持 —— 已确认，不是配置问题。** 插件的 host 半个
+   求和仍会低估真实收益（`replaced: true` 过滤则正确）。
+8. **设置接口的门禁与 LAN 绑定。** `/iot-thinking/api/config` 与
+   `/status` 挂在宿主 `webServer` 上，而宿主只维护路由表、不做鉴权 —— 所以这两个
+   handler 自己守：要求自定义头 `x-iot-thinking: 1`（跨站页面设不了它而不触发预检，
+   本服务从不回 CORS 批准）、`Sec-Fetch-Site` 只收 `same-origin`/`none`、`Origin`
+   的 host 必须等于 `Host`、拒绝 opaque origin（DNS rebinding）、默认**只接受
+   loopback 对端**。GET 不再下发配置文件的绝对路径，账本事件只保留卡片要用的字段
+   （不再有 `sessionId` / `archived` / `provider` / `model`）。
+   **代价**：若你把 web 绑定到 `0.0.0.0`（如 `dsh-lan-access`），设置卡片默认会被
+   403 拒绝；要恢复就在宿主环境里设 `IOT_THINKING_ALLOW_REMOTE=1`，并把「谁能访问
+   这个端口」当成安全边界来管理。
+9. **Electron 打包版（`app.asar`）不支持 —— 已确认，不是配置问题。** 插件的 host 半个
    要从盘上找到宿主的 `@deepseek-ai/dsh-llm`（见 `lib/seams.mjs`）。打包版把它放在
    `resources/app.asar` 归档里，`existsSync` / `readFileSync` 对外部进程看不见归档内部，
    `IOT_DSH_SEAM_ANCHORS` 指向 asar 路径也救不回来（路径换成了 asar 那条，判据仍是"目录里
    有 package.json"，永远读不到）。**现象**：装完能聊天、能出答案，只有 stderr 一行
    `warning: 1 entry did not activate`，账本里没有 `constructed`。适用面是 npm 安装、
    版本化安装（`$DSH_HOME/dsh-<ver>/`）和源码 checkout。
-9. **装完先看账本，别信"装上了"。** 只有 `$DSH_HOME/plugin-data/iot-thinking/events.jsonl`
-   里出现 `constructed`，才说明这条 entry 真的激活了；否则就是第 8 条那种静默失效。
+10. **装完先看账本，别信"装上了"。** 只有 `$DSH_HOME/plugin-data/iot-thinking/events.jsonl`
+    里出现 `constructed`，才说明这条 entry 真的激活了；否则就是第 9 条那种静默失效。
