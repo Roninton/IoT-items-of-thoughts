@@ -1,0 +1,35 @@
+{
+  "name": "dsh-plugin-iot-thinking",
+  "version": "0.1.0",
+  "description": "IoT thinking-block compression for DeepSeek Harness: rewrite the reasoning block inside llm/stream before the assistant message is committed, so the model sees the compact block in place (no compaction checkpoint).",
+  "type": "module",
+  "main": "dsh-plugin-iot-thinking/index.mjs",
+  "exports": {
+    ".": "./dsh-plugin-iot-thinking/index.mjs",
+    "./client": "./dsh-plugin-iot-thinking/lib/client.js",
+    "./package.json": "./dsh-plugin-iot-thinking/package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh-plugin-iot-thinking/cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Roninton/IoT-items-of-thoughts.git"
+  }
+}
