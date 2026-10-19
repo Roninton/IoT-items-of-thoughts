@@ -90,9 +90,24 @@ thinking-degenerate { stage: "input" | "output", action: "retry" | "fallback" | 
 
 ## Install
 
+装这个插件有 **一个必踩的坑**：仓库根和插件子目录是两个不同的包目录。
+插件管理器只认**声明了 `dsh.bundle` 的那一层**，所以别把"仓库地址"当成"插件地址"。
+
+| 你手里的东西 | 该填什么 |
+|---|---|
+| GitHub 仓库根地址（`https://github.com/Roninton/IoT-items-of-thoughts`） | **可以**（根 `package.json` 已声明 `dsh.bundle.patch`，指向子目录） |
+| GitHub 子目录页地址（`…/tree/main/dsh-plugin-iot-thinking`） | **不要填**：安装器只收"仓库"或"tarball"，`tree/...` 会被判 `invalid-spec` |
+| 本机目录：仓库根 `…\IoT-items-of-thoughts` | **可以**（同上） |
+| npm 包名 `dsh-plugin-iot-thinking` | 尚未发布到 npm，填了会 `not-found` |
+
+失败时的报错分别是：`这个包没有声明组合包，无法作为插件安装`（安装前预检，`not-a-bundle`）、
+`这个包没有声明组合包，不能作为插件管理`（装完发现包里没有 `dsh.bundle`，`not-bundle`）、
+`无法识别这个包名或地址`（`tree/...` 这类 URL）。三条都是"填错了那一层"的症状。
+
 ### From the UI
 
-Settings → Plugins → **添加插件** → enter the absolute path:
+Settings → Plugins → **添加插件** → enter the absolute path of the **package
+directory** (the repo root is now a valid package too):
 
 ```text
 D:\_playground\workspace\IoT-items-of-thoughts\dsh-plugin-iot-thinking
@@ -134,9 +149,9 @@ Settings → Plugins → **IoT 思考压缩**:
 或在 `cordis.patch.yml` 的 row 里给部署级默认值。改完**下一轮模型请求**生效，不用重启。
 
 - **已启用 / 已关闭** — the live switch;
-- **最小压缩字符数（`minChars`）** — drafts shorter than this are left alone (default 400).
-  400 是"够覆盖多数会话草稿"的下限：实测 400–500 区间是**净亏**（省几个字符，
-  付一次完整模型调用 + 1.2–1.9 s 首字延迟），按自己的会话规模调到 **700–800** 更划算。
+- **最小压缩字符数（`minChars`）** — drafts shorter than this are left alone (default 700).
+  默认值不是拍的：实测 400–500 区间**净亏**（省几个字符，付一次完整模型调用
+  + 1.2–1.9 s 首字延迟），所以默认提到 700；按自己的会话规模在 **700–900** 之间调更划算。
   想知道自己的分布，看 `below-min-chars` 的 `chars` 与 `block-replaced` 的 `charsIn`;
 - **最大输入字符数** — drafts longer than this are left alone (default 24000);
 - **节点输出上限** — compressor `maxTokens` (default 2000);
@@ -180,6 +195,11 @@ $DSH_HOME/plugin-data/iot-thinking/events.jsonl
 
 Events: `constructed`, `block-replaced`, `block-kept`, `block-skipped`,
 `block-failed`, `thinking-compressed`, `thinking-failed`, `thinking-degenerate`.
+
+`thinking-compressed` 带 `replaced: true|false`：压缩器给出了结果，但只有
+`replaced: true` 的块真的替换了会话里的原文。想按块统计收益，用
+`block-replaced`（每条都真实替换了）或按 `replaced: true` 过滤；直接对
+`thinking-compressed` 求和会把 `not-shorter` 的块算进去，低估真实压缩率。
 
 Original drafts are archived before replacement:
 
@@ -231,6 +251,16 @@ degenerate input/output detection, strict retry, and deterministic fallback.
    gate rejects the first output; the deterministic fallback itself is local.
 6. **The fallback is lossy.** If both attempts are degenerate, it keeps at most
    one fact line plus a plan line; the full draft remains in `originals/`.
-7. **统计压缩率请用 `block-replaced`，不是 `thinking-compressed`。** 后者在"决定要不要替换"
-   之前就发出去了：它只说明这次压出过结果。变长的块会被 `block-kept (reason=not-shorter)`
-   拦下、原文照旧保留，所以拿 `thinking-compressed` 求和会低估真实收益。
+7. **统计压缩率请用 `block-replaced`，不是 `thinking-compressed`。** 后者现在带
+   `replaced: true|false`：只有 `true` 的块真的替换了原文。变长的块会被
+   `block-kept (reason=not-shorter)` 拦下、原文照旧保留，所以拿 `thinking-compressed`
+   求和仍会低估真实收益。
+8. **Electron 打包版（`app.asar`）不支持 —— 已确认，不是配置问题。** 插件的 host 半个
+   要从盘上找到宿主的 `@deepseek-ai/dsh-llm`（见 `lib/seams.mjs`）。打包版把它放在
+   `resources/app.asar` 归档里，`existsSync` / `readFileSync` 对外部进程看不见归档内部，
+   `IOT_DSH_SEAM_ANCHORS` 指向 asar 路径也救不回来（路径换成了 asar 那条，判据仍是"目录里
+   有 package.json"，永远读不到）。**现象**：装完能聊天、能出答案，只有 stderr 一行
+   `warning: 1 entry did not activate`，账本里没有 `constructed`。适用面是 npm 安装、
+   版本化安装（`$DSH_HOME/dsh-<ver>/`）和源码 checkout。
+9. **装完先看账本，别信"装上了"。** 只有 `$DSH_HOME/plugin-data/iot-thinking/events.jsonl`
+   里出现 `constructed`，才说明这条 entry 真的激活了；否则就是第 8 条那种静默失效。

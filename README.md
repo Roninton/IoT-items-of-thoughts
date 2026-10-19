@@ -26,6 +26,8 @@
 # 1) 装插件（DSH 0.2.x / node >= 20）
 dsh plugin --profile web add "<repo>\dsh-plugin-iot-thinking"
 #    也可以走 UI：Settings → Plugins → 添加插件 → 填上面那个绝对路径
+#    ⚠️ 填「声明了 dsh.bundle 的那一层」：子目录或仓库根都行（根 package.json 已声明），
+#       但不要填 GitHub 的 /tree/main/... 子目录页地址，那是 invalid-spec
 #    装完重启一次 dsh web（host 模块是新的；client 半个从 exports["./client"] 出）
 
 # 2) 插件自测（纯逻辑，不启动 dsh、不连模型）
@@ -36,7 +38,8 @@ $env:PYTHONPATH = "$PWD\src"
 python -m pytest -q -m "not slow"
 ```
 
-开关与参数在 **Settings → Plugins → IoT 思考压缩**：启用/关闭、最小压缩字数（默认 400）、
+开关与参数在 **Settings → Plugins → IoT 思考压缩**：启用/关闭、最小压缩字数（默认 700；
+400–500 区间实测净亏，见插件 README）、
 最大输入字数（默认 24000）、节点输出上限（`maxTokens`，默认 2000）、最多节点数（默认 8）、
 最多 `[中性]` 数（默认 2）、可选 provider/model，以及**压缩档位**（`compact` 3 标签 /
 `balanced` 5 标签 / `full` 8 标签）。配置写到 `$DSH_HOME/plugin-data/iot-thinking/config.json`，
