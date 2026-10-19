@@ -15,7 +15,7 @@ import {
   sanitizeDraft,
 } from "./lib/think.mjs";
 import { compressThinking } from "./lib/compress.mjs";
-import { rootFromEntryPath, versionedRoots } from "./lib/seams.mjs";
+import { defaultNodeModulesRoots, rootFromEntryPath, versionedRoots } from "./lib/seams.mjs";
 
 let failures = 0;
 async function check(name, fn) {
@@ -450,6 +450,29 @@ await check("seam 锚点：版本化安装按 mtime 降序、忽略非 dsh- 目�
   assert.ok(roots[1].includes("dsh-0.2.0-rc.2"));
   assert.ok(roots[2].includes("dsh-broken-mtime"));
   assert.deepEqual(versionedRoots("", fakeFs), []);
+});
+
+await check("seam 锚点：argv[1] 推导排在 profiles/node_modules 之前", () => {
+  // 多版本共存：profiles/node_modules 里可能 hoist 着另一个 dsh 版本的 seam。
+  // 先命中它 = 插件与宿主拿到两份不同实例 —— 必须让"正在跑的入口"先赢。
+  const roots = defaultNodeModulesRoots({
+    entry: "D:\\dsh-home\\dsh-0.2.1-rc.2\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js",
+    home: "D:\\dsh-home",
+    fs: { readdirSync: () => [], statSync: () => ({ mtimeMs: 0 }) },
+  });
+  assert.equal(roots[0], "D:\\dsh-home\\dsh-0.2.1-rc.2\\node_modules");
+  const profilesAt = roots.indexOf("D:\\dsh-home\\profiles\\node_modules");
+  assert.ok(profilesAt > 0, "profiles 根仍在候选里，只是排在后面");
+  assert.ok(!roots.slice(0, profilesAt).some((r) => r.endsWith("profiles\\node_modules")));
+});
+
+await check("seam 锚点：入口落空时才用 profiles 根", () => {
+  const roots = defaultNodeModulesRoots({
+    entry: "D:\\tmp\\not-under-node-modules\\selftest.mjs",
+    home: "D:\\dsh-home",
+    fs: { readdirSync: () => [], statSync: () => ({ mtimeMs: 0 }) },
+  });
+  assert.equal(roots[0], "D:\\dsh-home\\profiles\\node_modules");
 });
 
 console.log(failures === 0 ? "\n全部通过" : `\n${failures} 项失败`);

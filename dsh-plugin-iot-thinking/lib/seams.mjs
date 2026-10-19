@@ -65,21 +65,30 @@ export function versionedRoots(home, fs = { readdirSync, statSync }) {
   return found.sort((a, b) => b.mtime - a.mtime).map((x) => x.root);
 }
 
-function defaultNodeModulesRoots() {
+/**
+ * 宿主 node_modules 候选根，按可信度排序。
+ *
+ * 顺序是语义，不是风格：`profiles/node_modules` 里可能 hoist 着另一个 dsh
+ * 版本的 `@deepseek-ai/dsh-llm`，先命中它等于让插件与宿主拿到两份不同实例的
+ * seam（Service/instanceof 会分裂）。所以"正在跑的入口"永远排第一，profile 根
+ * 只在入口推导落空时用。
+ *
+ * fs / entry / home 可注入，自测不必真建目录、也不必改 process。
+ */
+export function defaultNodeModulesRoots({ entry = process.argv[1], home = process.env.DSH_HOME, fs } = {}) {
   const roots = [];
   const push = (p) => { if (p && !roots.includes(p)) roots.push(p); };
-  const home = process.env.DSH_HOME;
 
-  // 1) profile 解析根（既有行为：与宿主共享已 hoist 的那份）
+  // 1) 正在跑的宿主入口 —— 唯一"确定就是当前这个 dsh"的锚点。
+  //    issue #1：旧候选表全是 profiles/全局/系统路径，五个全部落空 → importSeam
+  //    抛错 → cordis 把这条 entry 静默跳过（只留一行 warning），thinking 完全没被压缩。
+  push(rootFromEntryPath(entry));
+
+  // 2) profile 解析根。只在入口推导落空时使用：它可能装着别的 dsh 版本的副本。
   if (home) push(join(home, "profiles", "node_modules"));
 
-  // 2) 正在跑的宿主入口 —— 版本化安装（<DSH_HOME>/dsh-0.2.1-rc.2/）只有这条能命中。
-  //    issue #1：旧候选表全是 profiles/全局/系统路径，五个全部落空 → importSeam 抛错
-  //    → cordis 把这条 entry 静默跳过（只留一行 warning），thinking 完全没被压缩。
-  push(rootFromEntryPath(process.argv[1]));
-
   // 3) 兜底：扫 DSH_HOME 下的版本化安装（入口被 wrapper 改写、argv[1] 不可用时）
-  if (home) for (const r of versionedRoots(home)) push(r);
+  if (home) for (const r of versionedRoots(home, fs)) push(r);
 
   // 4) 安装根
   if (home) push(join(home, "..", "node_modules"));
