@@ -6,32 +6,95 @@
 //   按绝对路径导入还能与宿主共享同一个模块缓存，避免 Service/instanceof 分裂
 //   （分裂的后果是 "ctx.compaction 已经有人注册" 或类型判断失效）。
 //
-// 锚点：env IOT_DSH_SEAM_ANCHORS（按 path.delimiter 分隔，追加在前）优先。
+// 锚点顺序：env IOT_DSH_SEAM_ANCHORS（按 path.delimiter 分隔，追加在前）
+//   → $DSH_HOME/profiles/node_modules
+//   → 从 process.argv[1]（宿主入口）上溯出的 node_modules
+//   → $DSH_HOME 下版本化安装 dsh-<ver>/node_modules（按 mtime 降序）
+//   → 安装根 / npm 全局 / 传统 Linux 路径。
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execSync } from "node:child_process";
 
+/**
+ * 从入口脚本路径上溯出 node_modules 根。
+ * 取**最后一层** node_modules：pnpm 的 `<nm>/.pnpm/<pkg>@<ver>/node_modules/<pkg>/...`
+ * 只有最里层才真的放得下 @deepseek-ai/*。
+ *
+ *   <DSH_HOME>/dsh-0.2.1-rc.2/node_modules/@deepseek-ai/dsh/lib/bin.js
+ *     -> <DSH_HOME>/dsh-0.2.1-rc.2/node_modules
+ *
+ * 纯字符串处理（两种分隔符都认），所以自测能直接喂任意平台的假路径。
+ */
+export function rootFromEntryPath(entry) {
+  if (typeof entry !== "string" || !entry) return null;
+  const re = /[\\/]node_modules(?=[\\/]|$)/gi;
+  let last = null;
+  for (let m = re.exec(entry); m; m = re.exec(entry)) last = m;
+  if (!last) return null;
+  return entry.slice(0, last.index) + last[0][0] + "node_modules";
+}
+
+/**
+ * $DSH_HOME 下的版本化安装：`dsh-<ver>/node_modules`。
+ * 多版本共存时按目录 mtime 降序 —— 刚装上的那个先试。
+ * fs 可注入，自测不必真建目录。
+ */
+export function versionedRoots(home, fs = { readdirSync, statSync }) {
+  if (typeof home !== "string" || !home) return [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(home, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const found = [];
+  for (const entry of entries) {
+    if (typeof entry?.isDirectory !== "function" || !entry.isDirectory()) continue;
+    if (!/^dsh-/i.test(entry.name)) continue;
+    const root = join(home, entry.name, "node_modules");
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(join(home, entry.name)).mtimeMs || 0;
+    } catch {
+      /* 取不到 mtime 就排最后，别让一个目录拖垮解析 */
+    }
+    found.push({ root, mtime });
+  }
+  return found.sort((a, b) => b.mtime - a.mtime).map((x) => x.root);
+}
+
 function defaultNodeModulesRoots() {
   const roots = [];
   const push = (p) => { if (p && !roots.includes(p)) roots.push(p); };
-
-  // 1) DSH_HOME 推导：profiles/node_modules 是 profile 解析根（优先），上一级是安装根
   const home = process.env.DSH_HOME;
-  if (home) {
-    push(join(home, "profiles", "node_modules"));
-    push(join(home, "..", "node_modules"));
-  }
-  // 2) npm 全局根
+
+  // 1) profile 解析根（既有行为：与宿主共享已 hoist 的那份）
+  if (home) push(join(home, "profiles", "node_modules"));
+
+  // 2) 正在跑的宿主入口 —— 版本化安装（<DSH_HOME>/dsh-0.2.1-rc.2/）只有这条能命中。
+  //    issue #1：旧候选表全是 profiles/全局/系统路径，五个全部落空 → importSeam 抛错
+  //    → cordis 把这条 entry 静默跳过（只留一行 warning），thinking 完全没被压缩。
+  push(rootFromEntryPath(process.argv[1]));
+
+  // 3) 兜底：扫 DSH_HOME 下的版本化安装（入口被 wrapper 改写、argv[1] 不可用时）
+  if (home) for (const r of versionedRoots(home)) push(r);
+
+  // 4) 安装根
+  if (home) push(join(home, "..", "node_modules"));
+
+  // 5) npm 全局根
   try {
     const g = execSync("npm root -g", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     push(g);
   } catch { /* 无 npm 跳过 */ }
-  // 3) 传统 Linux 路径
+
+  // 6) 传统 Linux 路径
   push("/usr/lib/node_modules");
   push("/usr/local/lib/node_modules");
-  // 4) dsh 安装内未 hoist 时的 scope 目录
+
+  // 7) dsh 安装内未 hoist 时的 scope 目录
   for (const r of [...roots]) push(join(r, "@deepseek-ai", "dsh", "node_modules"));
   return roots;
 }

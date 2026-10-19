@@ -15,6 +15,7 @@ import {
   sanitizeDraft,
 } from "./lib/think.mjs";
 import { compressThinking } from "./lib/compress.mjs";
+import { rootFromEntryPath, versionedRoots } from "./lib/seams.mjs";
 
 let failures = 0;
 async function check(name, fn) {
@@ -374,6 +375,54 @@ await check("balanced 档位：5 标签提示词", () => {
   assert.match(prompt, /\[决定\]/);
   assert.match(prompt, /\[计划\]/);
   assert.match(prompt, /目标 4~6 条，最多 6 条/);
+});
+
+await check("seam 锚点：版本化安装的入口能上溯出 node_modules", () => {
+  assert.equal(
+    rootFromEntryPath("D:\\dsh-home\\dsh-0.2.1-rc.2\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js"),
+    "D:\\dsh-home\\dsh-0.2.1-rc.2\\node_modules"
+  );
+  assert.equal(
+    rootFromEntryPath("/opt/dsh-home/dsh-0.2.1-rc.2/node_modules/@deepseek-ai/dsh/lib/bin.js"),
+    "/opt/dsh-home/dsh-0.2.1-rc.2/node_modules"
+  );
+});
+
+await check("seam 锚点：pnpm 嵌套时取最里层 node_modules", () => {
+  assert.equal(
+    rootFromEntryPath(
+      "/home/u/.dsh/profiles/node_modules/.pnpm/@deepseek-ai+dsh@0.2.1/node_modules/@deepseek-ai/dsh/lib/bin.js"
+    ),
+    "/home/u/.dsh/profiles/node_modules/.pnpm/@deepseek-ai+dsh@0.2.1/node_modules"
+  );
+});
+
+await check("seam 锚点：入口不在 node_modules 下时返回 null", () => {
+  assert.equal(rootFromEntryPath("D:\\_playground\\selftest.mjs"), null);
+  assert.equal(rootFromEntryPath(""), null);
+  assert.equal(rootFromEntryPath(undefined), null);
+});
+
+await check("seam 锚点：版本化安装按 mtime 降序、忽略非 dsh- 目录", () => {
+  const fakeFs = {
+    readdirSync: () => [
+      { name: "dsh-0.2.0-rc.2", isDirectory: () => true },
+      { name: "dsh-0.2.1-rc.2", isDirectory: () => true },
+      { name: "profiles", isDirectory: () => true },
+      { name: "dsh-broken-mtime", isDirectory: () => true },
+    ],
+    statSync: (p) => {
+      if (p.endsWith("dsh-0.2.1-rc.2")) return { mtimeMs: 200 };
+      if (p.endsWith("dsh-0.2.0-rc.2")) return { mtimeMs: 100 };
+      throw new Error("ENOENT");
+    },
+  };
+  const roots = versionedRoots("/home/u/.dsh", fakeFs);
+  assert.equal(roots.length, 3); // 三个 dsh- 目录都算候选，取不到 mtime 的排最后
+  assert.ok(roots[0].includes("dsh-0.2.1-rc.2"));
+  assert.ok(roots[1].includes("dsh-0.2.0-rc.2"));
+  assert.ok(roots[2].includes("dsh-broken-mtime"));
+  assert.deepEqual(versionedRoots("", fakeFs), []);
 });
 
 console.log(failures === 0 ? "\n全部通过" : `\n${failures} 项失败`);

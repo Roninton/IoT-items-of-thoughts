@@ -111,12 +111,33 @@ dsh plugin --profile web add "D:\_playground\workspace\IoT-items-of-thoughts\dsh
 Restart `dsh web` once after installing (the host module is new). The client
 half is served from `exports["./client"]`.
 
+### 版本化安装（`$DSH_HOME/dsh-<ver>/`）
+
+版本化安装把包装在 `<DSH_HOME>/dsh-<ver>/node_modules/@deepseek-ai/`，而不是
+`profiles/node_modules`。插件按 `process.argv[1]`（宿主入口）上溯出这个目录，
+并兜底扫描 `$DSH_HOME/dsh-*/node_modules`（多版本共存取最近安装的），所以不用额外配置。
+
+若仍报 `找不到宿主 seam 包 @deepseek-ai/dsh-llm`，显式指定锚点：
+
+```powershell
+$env:IOT_DSH_SEAM_ANCHORS = "<DSH_HOME>/dsh-<ver>/node_modules"
+```
+
+装完先确认插件真的激活了：账本里该有 `constructed`，之后才轮到 `thinking-compressed` /
+`block-replaced`。只有一行 `warning: 1 entry did not activate` 而账本空着，就是没生效。
+
 ## Switch and limits
 
 Settings → Plugins → **IoT 思考压缩**:
 
+以下每一项都在卡片里直接改；也可以写 `$DSH_HOME/plugin-data/iot-thinking/config.json`，
+或在 `cordis.patch.yml` 的 row 里给部署级默认值。改完**下一轮模型请求**生效，不用重启。
+
 - **已启用 / 已关闭** — the live switch;
-- **最小压缩字符数** — drafts shorter than this are left alone (default 400);
+- **最小压缩字符数（`minChars`）** — drafts shorter than this are left alone (default 400).
+  400 是"够覆盖多数会话草稿"的下限：实测 400–500 区间是**净亏**（省几个字符，
+  付一次完整模型调用 + 1.2–1.9 s 首字延迟），按自己的会话规模调到 **700–800** 更划算。
+  想知道自己的分布，看 `below-min-chars` 的 `chars` 与 `block-replaced` 的 `charsIn`;
 - **最大输入字符数** — drafts longer than this are left alone (default 24000);
 - **节点输出上限** — compressor `maxTokens` (default 2000);
 - **最多节点数** — hard cap on the node chain (default 8);
@@ -210,3 +231,6 @@ degenerate input/output detection, strict retry, and deterministic fallback.
    gate rejects the first output; the deterministic fallback itself is local.
 6. **The fallback is lossy.** If both attempts are degenerate, it keeps at most
    one fact line plus a plan line; the full draft remains in `originals/`.
+7. **统计压缩率请用 `block-replaced`，不是 `thinking-compressed`。** 后者在"决定要不要替换"
+   之前就发出去了：它只说明这次压出过结果。变长的块会被 `block-kept (reason=not-shorter)`
+   拦下、原文照旧保留，所以拿 `thinking-compressed` 求和会低估真实收益。
