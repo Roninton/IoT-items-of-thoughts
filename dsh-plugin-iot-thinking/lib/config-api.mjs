@@ -3,18 +3,102 @@
 // Static client bundles cannot extend the typert remote catalog, so the plugin
 // uses the same channel as context-memory: an exact HTTP route on ctx.webServer
 // plus a same-origin fetch from the client half. dsh web binds to 127.0.0.1.
+//
+// THREAT MODEL (review #01a153e4-75e4, "harmful"): these routes are reachable
+// from anything that can speak HTTP to the port, and nothing upstream
+// authenticates them — the host webserver only keeps a route table. So the
+// handlers guard themselves:
+//   * a custom request header the UI sets and a cross-site page cannot set
+//     without a preflight this server refuses (no CORS approval is ever sent);
+//   * same-origin checks on Origin / Sec-Fetch-Site / Host so a DNS-rebinding
+//     page (same origin after rebind) and a LAN peer are both refused;
+//   * loopback and same-host peers only, unless the operator set IOT_THINKING_ALLOW_REMOTE=1.
+// Without this, an unauthenticated PUT rewrites provider/model and every
+// reasoning block is streamed to the attacker's endpoint (F1), and GET leaks
+// the config path plus session ids from the ledger (F2).
 
 import { tailEvents } from "./ledger.mjs";
 import { PROFILES } from "./think.mjs";
 
 const MAX_BODY_BYTES = 256 * 1024;
 
-function sendJson(res, status, body) {
+/** Header the Settings card adds; a cross-site form/fetch cannot forge it without a preflight. */
+const GUARD_HEADER = "x-iot-thinking";
+const GUARD_VALUE = "1";
+
+export function sendJson(res, status, body) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
   });
   res.end(JSON.stringify(body));
+}
+
+/**
+ * Whether a request may touch the config bridge.
+ *
+ * Three independent signals, because each alone is bypassable: the guard header
+ * is a preflight barrier for browsers (and a shared secret against a bare
+ * curl only in the sense the UI always sends it — it is NOT auth), Origin /
+ * Sec-Fetch-Site rejects cross-site documents, and the peer/loopback rule keeps
+ * a LAN peer out even when it replays every header it observed.
+ *
+ * @param {object} req - node IncomingMessage.
+ * @returns {{ok: true} | {ok: false, status: number, reason: string}}
+ */
+export function guardRequest(req) {
+  const headers = req.headers ?? {};
+  if (headers[GUARD_HEADER] !== GUARD_VALUE) {
+    return { ok: false, status: 403, reason: "missing guard header" };
+  }
+
+  // Browsers set Sec-Fetch-Site; a cross-site document is cross-site or none.
+  const site = headers["sec-fetch-site"];
+  if (site !== undefined && site !== "same-origin" && site !== "none") {
+    return { ok: false, status: 403, reason: `cross-site request (${site})` };
+  }
+
+  // An Origin that is present must match the Host this server answers on.
+  const origin = headers.origin;
+  if (origin !== undefined && origin !== "null") {
+    let originHost;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      return { ok: false, status: 403, reason: "unparsable origin" };
+    }
+    if (String(headers.host ?? "") !== originHost) {
+      return { ok: false, status: 403, reason: `origin ${originHost} != host ${String(headers.host ?? "")}` };
+    }
+  } else if (origin === "null") {
+    // A sandboxed/opaque origin is a cross-site document by definition.
+    return { ok: false, status: 403, reason: "opaque origin" };
+  }
+
+  if (process.env.IOT_THINKING_ALLOW_REMOTE !== "1") {
+    // The default Web composition binds 127.0.0.1, so a loopback peer is the
+    // UI. A LAN-bound composition (dsh-lan-access) deliberately exposes the
+    // card to the network; the operator opts into that with
+    // IOT_THINKING_ALLOW_REMOTE=1 rather than this code trusting a Host header
+    // (which any client can forge). An absent socket proves nothing, so it is
+    // refused rather than treated as loopback.
+    const remote = req.socket?.remoteAddress;
+    const loopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+    if (!loopback) return { ok: false, status: 403, reason: `peer ${String(remote)} is not loopback` };
+  }
+
+  return { ok: true };
+}
+
+/** Ledger rows as the card needs them: no session ids, no archive paths. */
+export function redactEvents(events) {
+  return events.map((entry) => {
+    const row = {};
+    for (const key of ["event", "t", "index", "charsIn", "charsOut", "chars", "ms", "reason", "profile", "retried", "fallback", "truncated", "finish"]) {
+      if (entry[key] !== undefined) row[key] = entry[key];
+    }
+    return row;
+  });
 }
 
 function readBody(req) {
@@ -64,9 +148,18 @@ function sanitize(payload) {
 
 function doRegister(ctx, ws, store) {
   const config = async (req, res) => {
+    const gate = guardRequest(req);
+    if (!gate.ok) {
+      ctx.logger?.warn?.(`iot-thinking config api refused: ${gate.reason}`);
+      sendJson(res, gate.status, { error: "forbidden" });
+      return;
+    }
     try {
       if (req.method === "GET") {
-        sendJson(res, 200, { config: store.load(), path: store.path });
+        // `path` is the user's home directory under $DSH_HOME: keep it out of the
+        // wire format (F2), the card never rendered it.
+        const { path: _omit, ...safe } = store.load();
+        sendJson(res, 200, { config: safe });
         return;
       }
       if (req.method === "PUT") {
@@ -89,18 +182,27 @@ function doRegister(ctx, ws, store) {
       sendJson(res, 405, { error: "method not allowed" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // Log the reason, not the request body: it can hold a provider/model the
+      // attacker chose, and the operator only needs to know the write failed.
       ctx.logger?.warn?.(`iot-thinking config api: ${message}`);
       sendJson(res, 500, { error: message });
     }
   };
 
   const status = (req, res) => {
+    const gate = guardRequest(req);
+    if (!gate.ok) {
+      ctx.logger?.warn?.(`iot-thinking status api refused: ${gate.reason}`);
+      sendJson(res, gate.status, { error: "forbidden" });
+      return;
+    }
     if (req.method !== "GET") {
       sendJson(res, 405, { error: "method not allowed" });
       return;
     }
     try {
-      sendJson(res, 200, { config: store.load(), path: store.path, events: tailEvents(25) });
+      const { path: _omit, ...safe } = store.load();
+      sendJson(res, 200, { config: safe, events: redactEvents(tailEvents(25)) });
     } catch (error) {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }

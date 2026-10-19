@@ -16,6 +16,7 @@ import {
 } from "./lib/think.mjs";
 import { compressThinking } from "./lib/compress.mjs";
 import { defaultNodeModulesRoots, rootFromEntryPath, versionedRoots } from "./lib/seams.mjs";
+import { guardRequest, redactEvents } from "./lib/config-api.mjs";
 
 let failures = 0;
 async function check(name, fn) {
@@ -473,6 +474,44 @@ await check("seam 锚点：入口落空时才用 profiles 根", () => {
     fs: { readdirSync: () => [], statSync: () => ({ mtimeMs: 0 }) },
   });
   assert.equal(roots[0], "D:\\dsh-home\\profiles\\node_modules");
+});
+
+await check("config API 门禁：缺自定义头一律 403", () => {
+  const loopback = { socket: { remoteAddress: "127.0.0.1" }, headers: {} };
+  assert.equal(guardRequest(loopback).ok, false);
+  assert.equal(guardRequest(loopback).status, 403);
+  const withHeader = { socket: { remoteAddress: "127.0.0.1" }, headers: { "x-iot-thinking": "1" } };
+  assert.equal(guardRequest(withHeader).ok, true);
+});
+
+await check("config API 门禁：跨站 / 伪装 Origin / 非 loopback 全拒", () => {
+  const base = (extra, remote = "127.0.0.1") => ({ socket: { remoteAddress: remote }, headers: { "x-iot-thinking": "1", host: "127.0.0.1:3080", ...extra } });
+  assert.equal(guardRequest(base({ "sec-fetch-site": "same-origin" })).ok, true);
+  assert.equal(guardRequest(base({ "sec-fetch-site": "cross-site" })).ok, false);
+  assert.equal(guardRequest(base({ "sec-fetch-site": "same-site" })).ok, false);
+  assert.equal(guardRequest(base({ origin: "https://127.0.0.1:3080" })).ok, true);
+  // A rebinding/cross-site page carries its own origin, which never matches the host.
+  assert.equal(guardRequest(base({ origin: "https://evil.example" })).ok, false);
+  assert.equal(guardRequest(base({ origin: "null" })).ok, false);
+  // A LAN peer cannot replay observed headers; loopback is required by default.
+  assert.equal(guardRequest(base({}, "192.168.1.9")).ok, false);
+  // An absent socket proves nothing.
+  assert.equal(guardRequest({ headers: { "x-iot-thinking": "1" } }).ok, false);
+});
+
+await check("status 事件脱敏：去掉 sessionId / archived", () => {
+  const rows = redactEvents([
+    { event: "block-replaced", t: "2026-10-19T00:00:00Z", sessionId: "s-1", archived: "D:\\x\\block0.txt", charsIn: 10, charsOut: 3, ms: 5 },
+    { event: "thinking-compressed", sessionId: "s-2", provider: "p", model: "m", profile: "full", fallback: true },
+  ]);
+  assert.equal(rows[0].sessionId, undefined);
+  assert.equal(rows[0].archived, undefined);
+  assert.equal(rows[0].charsIn, 10);
+  assert.equal(rows[1].sessionId, undefined);
+  assert.equal(rows[1].provider, undefined);
+  assert.equal(rows[1].model, undefined);
+  assert.equal(rows[1].profile, "full");
+  assert.equal(rows[1].fallback, true);
 });
 
 console.log(failures === 0 ? "\n全部通过" : `\n${failures} 项失败`);

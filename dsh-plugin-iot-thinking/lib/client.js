@@ -13,6 +13,10 @@ window.__ModuleLoader__.load({
     const inject = ["slots"];
     const API = "/iot-thinking/api/config";
     const STATUS = "/iot-thinking/api/status";
+    // The host webserver authenticates nothing; the card proves itself with a
+    // header a cross-site page cannot set without a preflight the server
+    // refuses (see lib/config-api.mjs guardRequest).
+    const GUARD = { "x-iot-thinking": "1" };
     const FALLBACK = {
       enabled: true,
       profile: "full",
@@ -63,7 +67,7 @@ window.__ModuleLoader__.load({
         setErr(null);
         if (announce) setMsg(null);
         try {
-          const resp = await fetch(STATUS, { method: "GET" });
+          const resp = await fetch(STATUS, { method: "GET", headers: GUARD });
           const data = await resp.json().catch(() => null);
           if (!resp.ok) throw new Error((data && data.error) || "HTTP " + resp.status);
           setCfg(data.config ?? FALLBACK);
@@ -86,12 +90,12 @@ window.__ModuleLoader__.load({
         setErr(null);
         setMsg(null);
         try {
-          const resp = await fetch(API, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(cfg) });
+          const resp = await fetch(API, { method: "PUT", headers: { ...GUARD, "content-type": "application/json" }, body: JSON.stringify(cfg) });
           const data = await resp.json().catch(() => null);
           if (!resp.ok) throw new Error((data && data.error) || "HTTP " + resp.status);
           if (data && data.config) setCfg(data.config);
           setMsg("已保存，下一次模型请求即时生效");
-          const status = await fetch(STATUS).then((r) => r.json()).catch(() => null);
+          const status = await fetch(STATUS, { headers: GUARD }).then((r) => r.json()).catch(() => null);
           if (status && Array.isArray(status.events)) setEvents(status.events);
         } catch (error) {
           setErr("保存失败：" + String(error.message || error));
