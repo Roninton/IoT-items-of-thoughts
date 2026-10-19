@@ -35,7 +35,7 @@ export async function* transformStream(source, options, deps) {
     return;
   }
 
-  const minChars = Number.isFinite(cfg.minChars) ? Math.max(0, cfg.minChars) : 700;
+  const minChars = Number.isFinite(cfg.minChars) ? Math.max(0, cfg.minChars) : 400;
   /** @type {Map<number, { text: string, chunks: any[] }>} */
   const buffers = new Map();
 

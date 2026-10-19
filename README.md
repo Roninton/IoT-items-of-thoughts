@@ -38,8 +38,8 @@ $env:PYTHONPATH = "$PWD\src"
 python -m pytest -q -m "not slow"
 ```
 
-开关与参数在 **Settings → Plugins → IoT 思考压缩**：启用/关闭、最小压缩字数（默认 700；
-400–500 区间实测净亏，见插件 README）、
+开关与参数在 **Settings → Plugins → IoT 思考压缩**：启用/关闭、最小压缩字数（默认 400；
+实测 400–500 区间收益很薄，想回本可调到 700–900，见插件 README）、
 最大输入字数（默认 24000）、节点输出上限（`maxTokens`，默认 2000）、最多节点数（默认 8）、
 最多 `[中性]` 数（默认 2）、可选 provider/model，以及**压缩档位**（`compact` 3 标签 /
 `balanced` 5 标签 / `full` 8 标签）。配置写到 `$DSH_HOME/plugin-data/iot-thinking/config.json`，

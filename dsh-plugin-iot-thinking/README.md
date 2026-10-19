@@ -149,9 +149,9 @@ Settings → Plugins → **IoT 思考压缩**:
 或在 `cordis.patch.yml` 的 row 里给部署级默认值。改完**下一轮模型请求**生效，不用重启。
 
 - **已启用 / 已关闭** — the live switch;
-- **最小压缩字符数（`minChars`）** — drafts shorter than this are left alone (default 700).
-  默认值不是拍的：实测 400–500 区间**净亏**（省几个字符，付一次完整模型调用
-  + 1.2–1.9 s 首字延迟），所以默认提到 700；按自己的会话规模在 **700–900** 之间调更划算。
+- **最小压缩字符数（`minChars`）** — drafts shorter than this are left alone (default 400).
+  这是个参数选择，不是缺陷：实测 400–500 区间收益很薄（省几个字符，付一次完整模型调用
+  + 1.2–1.9 s 首字延迟）；想要更明显的回本，按自己的会话规模在 **700–900** 之间调。
   想知道自己的分布，看 `below-min-chars` 的 `chars` 与 `block-replaced` 的 `charsIn`;
 - **最大输入字符数** — drafts longer than this are left alone (default 24000);
 - **节点输出上限** — compressor `maxTokens` (default 2000);

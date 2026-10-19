@@ -16,7 +16,8 @@
         # $DSH_HOME/plugin-data/iot-thinking/config.json and can be changed from
         # Settings → Plugins → IoT 思考压缩 without restarting dsh.
         enabled: true
-        # 400–500 char drafts cost more (one model call + 1.2–1.9 s) than they save.
-        minChars: 700
+        # 默认保持 400（不改既有行为）。实测 400–500 区间收益很薄，想要更明显的
+        # 回本可在设置卡片里调到 700–900 —— 这是调参建议，不是缺陷。
+        minChars: 400
         maxTokens: 2000
         archive: true
