@@ -16,7 +16,7 @@
  * @param {object} deps
  * @param {(options:any)=>boolean} deps.shouldTransform
  * @param {()=>object} deps.getConfig
- * @param {(text:string, options:any, cfg:object, index:number)=>Promise<string|null>} deps.compress
+ * @param {(text:string, options:any, cfg:object, index:number)=>Promise<{text:string,event:object}|string|null>} deps.compress
  * @param {(event:string, payload?:object)=>void} [deps.onEvent]
  */
 export async function* transformStream(source, options, deps) {
