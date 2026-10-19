@@ -35,7 +35,7 @@ export async function* transformStream(source, options, deps) {
     return;
   }
 
-  const minChars = Number.isFinite(cfg.minChars) ? Math.max(0, cfg.minChars) : 400;
+  const minChars = Number.isFinite(cfg.minChars) ? Math.max(0, cfg.minChars) : 700;
   /** @type {Map<number, { text: string, chunks: any[] }>} */
   const buffers = new Map();
 
@@ -70,19 +70,26 @@ export async function* transformStream(source, options, deps) {
       emit("block-failed", { index, chars: original.length, message: String(error?.message ?? error) });
     }
 
-    if (typeof compressed !== "string" || !compressed.trim() || compressed.trim().length >= original.trim().length) {
-      if (typeof compressed === "string" && compressed.trim()) {
-        emit("block-kept", { index, charsIn: original.length, charsOut: compressed.trim().length, reason: "not-shorter" });
+    // `compress` returns `{ text, event }`; a plain string is also accepted so the
+    // transformer stays testable with a trivial compressor.
+    const candidate = typeof compressed === "string" ? compressed : compressed?.text;
+    const candidateEvent = typeof compressed === "string" ? null : compressed?.event ?? null;
+    if (typeof candidate !== "string" || !candidate.trim() || candidate.trim().length >= original.trim().length) {
+      const shortened = typeof candidate === "string" && candidate.trim();
+      if (candidateEvent !== null) emit("thinking-compressed", { ...candidateEvent, replaced: false, reason: shortened ? "not-shorter" : "empty" });
+      if (shortened) {
+        emit("block-kept", { index, charsIn: original.length, charsOut: candidate.trim().length, reason: "not-shorter" });
       }
       yield* flush(index);
       yield block;
       return false;
     }
 
-    const text = compressed.trim();
+    const text = candidate.trim();
     yield { type: "reasoning-delta", index, text };
     yield { ...block, type: "block-end", index, block: { ...block.block, text } };
     buffers.delete(index);
+    if (candidateEvent !== null) emit("thinking-compressed", { ...candidateEvent, replaced: true });
     emit("block-replaced", { index, charsIn: original.length, charsOut: text.length });
     return true;
   };

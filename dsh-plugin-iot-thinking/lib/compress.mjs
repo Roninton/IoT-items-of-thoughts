@@ -16,6 +16,22 @@ import {
 } from "./think.mjs";
 
 /**
+ * A compressed item chain plus the ledger payload for it.
+ *
+ * The payload is not written here: only `lib/stream.mjs` knows whether the block
+ * is actually replaced or kept, and `thinking-compressed` must carry that answer
+ * (`replaced: true|false`) so a compression ratio read from the ledger is not
+ * inflated by blocks that were ultimately thrown away (issue #1, problem 3).
+ *
+ * @param {string} text - the item chain that stream.mjs may substitute.
+ * @param {object} payload - the ledger fields for this attempt.
+ * @returns {{ text: string, event: object }}
+ */
+function compressed(text, payload) {
+  return { text, event: payload };
+}
+
+/**
  * @param {object} args
  * @param {object} args.Llm - namespace from @deepseek-ai/dsh-llm
  * @param {object} args.ctx - plugin context (ctx.llm)
@@ -25,7 +41,7 @@ import {
  * @param {number} args.index - reasoning block index
  * @param {(info:object)=>string|null} args.archive - original-draft archiver
  * @param {(event:string,payload?:object)=>void} args.mark - ledger writer
- * @returns {Promise<string|null>} item chain, or null to keep the original
+ * @returns {Promise<{ text: string, event: object }|null>} item chain plus its ledger payload, or null to keep the original
  */
 export async function compressThinking({ Llm, ctx, text, options, cfg, index, archive, mark }) {
   const started = Date.now();
@@ -99,7 +115,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     const items = fallback();
     if (items) {
       mark("thinking-degenerate", { index, stage: "input", chars: text.length, charsOut: items.length, action: "fallback" });
-      mark("thinking-compressed", {
+      return compressed(items, {
         index,
         provider,
         model,
@@ -113,7 +129,6 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
         retried: false,
         fallback: true,
       });
-      return items;
     }
     mark("thinking-degenerate", { index, stage: "input", chars: text.length, action: "skip" });
     return null;
@@ -176,7 +191,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
           action: "fallback",
           retried,
         });
-        mark("thinking-compressed", {
+        return compressed(itemsFallback, {
           index,
           provider,
           model,
@@ -190,7 +205,6 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
           retried,
           fallback: true,
         });
-        return itemsFallback;
       }
       mark("thinking-degenerate", { index, stage: "output", charsIn: text.length, action: "skip", retried });
       return null;
@@ -202,7 +216,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     return null;
   }
 
-  mark("thinking-compressed", {
+  return compressed(items, {
     index,
     provider,
     model,
@@ -215,5 +229,4 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     truncated: lastFinish?.kind === "max-tokens",
     retried,
   });
-  return items;
 }

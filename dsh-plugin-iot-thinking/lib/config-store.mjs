@@ -14,7 +14,10 @@ import { homedir } from "node:os";
 export const DEFAULTS = Object.freeze({
   enabled: true,
   profile: "full",
-  minChars: 400,
+  // Measured on deepseek-flash: a 400–500 char block compresses to 70–95% of its
+  // input, so the saving does not pay for one full model call plus 1.2–1.9 s of
+  // first-token latency. 700 is the smallest default that clears that band.
+  minChars: 700,
   maxChars: 24000,
   maxTokens: 2000,
   maxNodes: 8,

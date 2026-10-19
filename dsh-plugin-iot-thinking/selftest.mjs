@@ -128,6 +128,30 @@ await check("压缩器收到 block 序号（用于归档命名）", async () => 
   assert.equal(seen, 7);
 });
 
+await check("thinking-compressed 带 replaced：真的替换了才是 true", async () => {
+  const events = [];
+  const captured = (compress) => ({
+    shouldTransform: () => true,
+    getConfig: () => ({ ...baseConfig, minChars: 1 }),
+    compress,
+    onEvent: (event, payload) => events.push({ event, ...payload }),
+  });
+  const payload = { index: 0, charsIn: 10, charsOut: 4, profile: "full" };
+
+  const input = [start(), delta("abcdefghij"), end("abcdefghij")];
+  await collect(transformStream(chunks(input), baseOptions, captured(async () => ({ text: "· X", event: payload }))));
+  const replaced = events.find((entry) => entry.event === "thinking-compressed");
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.charsOut, 4);
+
+  events.length = 0;
+  await collect(transformStream(chunks(input), baseOptions, captured(async () => ({ text: "a much longer output", event: payload }))));
+  const kept = events.find((entry) => entry.event === "thinking-compressed");
+  assert.equal(kept.replaced, false);
+  assert.equal(kept.reason, "not-shorter");
+  assert.ok(events.some((entry) => entry.event === "block-kept"));
+});
+
 await check("formatNodes 映射旧标签、去 bullet、节点之间空行", () => {
   const out = formatNodes("```text\n条目：\n· 正节点：X\n- 否掉：Y\n待定：Z\n```");
   assert.equal(out, "[支持] X\n\n[反对] Y\n\n[待定] Z");
@@ -313,7 +337,8 @@ await check("压缩器退化输出会严格重试，成功后返回新节点", a
   assert.equal(calls[0].temperature, 0.2);
   assert.equal(calls[1].temperature, 0.1);
   assert.match(calls[1].messages[0].content[0].text, /严格模式/);
-  assert.match(result, /\[决定\]/);
+  assert.match(result.text, /\[决定\]/);
+  assert.equal(result.event.fallback, undefined);
   assert.ok(events.some((entry) => entry.event === "thinking-degenerate" && entry.action === "retry"));
 });
 
@@ -340,8 +365,10 @@ await check("退化草稿不调用模型，直接走确定性兜底", async () =
     mark: (event, payload) => events.push({ event, ...payload }),
   });
   assert.equal(calls, 0);
-  assert.match(result, /\[计划\]/);
-  assert.ok(events.some((entry) => entry.event === "thinking-compressed" && entry.fallback === true));
+  assert.match(result.text, /\[计划\]/);
+  // The compressed event is written by stream.mjs, which alone knows whether the
+  // block was replaced; compressThinking hands over the payload.
+  assert.equal(result.event.fallback, true);
 });
 
 await check("compact 档位：3 标签提示词 + 8 标签归并", () => {

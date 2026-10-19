@@ -16,7 +16,7 @@ window.__ModuleLoader__.load({
     const FALLBACK = {
       enabled: true,
       profile: "full",
-      minChars: 400,
+      minChars: 700,
       maxChars: 24000,
       maxTokens: 2000,
       maxNodes: 8,
