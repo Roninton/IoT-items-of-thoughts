@@ -1,30 +1,15 @@
-// lib/stream.mjs — the llm/stream transformer.
-//
-// This is the whole trick: dsh assembles the assistant message from the chunks
-// this waterfall yields. If we hold the reasoning deltas until the block ends,
-// compress the draft, and then yield ONE compressed reasoning delta plus a
-// rewritten block-end, the committed assistant message already contains the
-// compact thinking block. There is no second message, no checkpoint, and no
-// "context compacted" event for the model to react to.
-//
-// The transformer is dependency-injected and has no dsh imports, so selftest can
-// drive it with a fake chunk source and a fake compressor.
+// 块级转换器：扣住 reasoning 增量，块结束时改写，回一个 delta + 改写的 block-end。
+// 因为替换发生在 assistant message 提交之前，所以没有 checkpoint、没有第二条消息。
+// 怎么改写由档位决定；这里只管缓冲、长度闸门、以及"能不能替换"。
+// 不 import dsh，自测可以用假 source 直接驱动。
 
-/**
- * The one rule that decides whether a compressed block may replace the original:
- * the candidate must be a non-empty string and strictly shorter once trimmed.
- * Exported because the Settings self-test must judge its result by exactly this
- * rule — a test that only looks for a non-empty reply reports green on a
- * compression the real link would never substitute.
- *
- * @param {unknown} original - the buffered original draft.
- * @param {unknown} candidate - what the compressor returned.
- * @returns {boolean} whether the candidate may replace the block.
- */
-export function isShorterReplacement(original, candidate) {
-  if (typeof candidate !== "string") return false;
-  const next = candidate.trim();
-  return next.length > 0 && next.length < String(original ?? "").trim().length;
+import { DEFAULT_STRATEGY, isShorterReplacement, strategyById } from "./strategies.mjs";
+
+export { isShorterReplacement };
+
+/** 兜底：配置里没有 strategy 就用默认档，绝不因为缺字段丢块。 */
+function strategyOf(cfg) {
+  return strategyById(cfg?.strategy) ?? strategyById(DEFAULT_STRATEGY);
 }
 
 /**
@@ -33,7 +18,9 @@ export function isShorterReplacement(original, candidate) {
  * @param {object} deps
  * @param {(options:any)=>boolean} deps.shouldTransform
  * @param {()=>object} deps.getConfig
- * @param {(text:string, options:any, cfg:object, index:number)=>Promise<{text:string,event:object}|string|null>} deps.compress
+ * @param {(text:string, options:any, cfg:object, index:number, extra:object)=>Promise<{text:string,event:object}|string|null>} deps.rewrite
+ * @param {()=>string[]} [deps.recent] - 跨轮记录：最近几段改写结果（口头禅闸用）
+ * @param {(text:string)=>void} [deps.remember]
  * @param {(event:string, payload?:object)=>void} [deps.onEvent]
  */
 export async function* transformStream(source, options, deps) {
@@ -52,7 +39,24 @@ export async function* transformStream(source, options, deps) {
     return;
   }
 
+  const strategy = strategyOf(cfg);
   const minChars = Number.isFinite(cfg.minChars) ? Math.max(0, cfg.minChars) : 400;
+  const maxChars = Number.isFinite(cfg.maxChars) ? Math.max(1, cfg.maxChars) : 24000;
+  const recent = () => {
+    try {
+      return deps.recent?.() ?? [];
+    } catch {
+      return [];
+    }
+  };
+  const remember = (text) => {
+    try {
+      deps.remember?.(text);
+    } catch {
+      /* 记账失败不该影响主流程 */
+    }
+  };
+
   /** @type {Map<number, { text: string, chunks: any[] }>} */
   const buffers = new Map();
 
@@ -73,29 +77,52 @@ export async function* transformStream(source, options, deps) {
       yield block;
       return false;
     }
-    if (original.trim().length < minChars) {
-      emit("block-skipped", { index, chars: original.length, reason: "below-min-chars" });
+    const chars = original.trim().length;
+    if (chars < minChars) {
+      emit("block-skipped", { index, chars, reason: "below-min-chars", strategy: strategy.id });
+      yield* flush(index);
+      yield block;
+      return false;
+    }
+    if (original.length > maxChars) {
+      emit("block-skipped", { index, chars, reason: "above-max-chars", maxChars, strategy: strategy.id });
       yield* flush(index);
       yield block;
       return false;
     }
 
-    let compressed = null;
+    let rewritten = null;
     try {
-      compressed = await deps.compress(original, options, cfg, index);
+      rewritten = await deps.rewrite(original, options, cfg, index, { recent: recent() });
     } catch (error) {
-      emit("block-failed", { index, chars: original.length, message: String(error?.message ?? error) });
+      emit("block-failed", { index, chars, message: String(error?.message ?? error), strategy: strategy.id });
     }
 
-    // `compress` returns `{ text, event }`; a plain string is also accepted so the
-    // transformer stays testable with a trivial compressor.
-    const candidate = typeof compressed === "string" ? compressed : compressed?.text;
-    const candidateEvent = typeof compressed === "string" ? null : compressed?.event ?? null;
-    if (!isShorterReplacement(original, candidate)) {
-      const shortened = typeof candidate === "string" && candidate.trim();
-      if (candidateEvent !== null) emit("thinking-compressed", { ...candidateEvent, replaced: false, reason: shortened ? "not-shorter" : "empty" });
-      if (shortened) {
-        emit("block-kept", { index, charsIn: original.length, charsOut: candidate.trim().length, reason: "not-shorter" });
+    // `rewrite` returns `{ text, event }`; a plain string is also accepted so the
+    // transformer stays testable with a trivial rewriter.
+    const candidate = typeof rewritten === "string" ? rewritten : rewritten?.text;
+    const candidateEvent = typeof rewritten === "string" ? null : rewritten?.event ?? null;
+    // 判定要带上 limits：自定义预设的替换规则（shorter / different）是配置出来的，
+    // 不在策略常量里。
+    const accepted = strategy.accepts(original, candidate, cfg.limits);
+
+    if (!accepted) {
+      const trimmed = typeof candidate === "string" ? candidate.trim() : "";
+      if (candidateEvent !== null) {
+        emit("thinking-rewritten", {
+          ...candidateEvent,
+          replaced: false,
+          reason: trimmed ? `not-${strategy.accept}` : "empty",
+        });
+      }
+      if (trimmed) {
+        emit("block-kept", {
+          index,
+          charsIn: original.length,
+          charsOut: trimmed.length,
+          reason: `not-${strategy.accept}`,
+          strategy: strategy.id,
+        });
       }
       yield* flush(index);
       yield block;
@@ -106,8 +133,15 @@ export async function* transformStream(source, options, deps) {
     yield { type: "reasoning-delta", index, text };
     yield { ...block, type: "block-end", index, block: { ...block.block, text } };
     buffers.delete(index);
-    if (candidateEvent !== null) emit("thinking-compressed", { ...candidateEvent, replaced: true });
-    emit("block-replaced", { index, charsIn: original.length, charsOut: text.length });
+    remember(text);
+    if (candidateEvent !== null) emit("thinking-rewritten", { ...candidateEvent, replaced: true });
+    emit("block-replaced", {
+      index,
+      charsIn: original.length,
+      charsOut: text.length,
+      strategy: strategy.id,
+      ...(strategy.metrics ? strategy.metrics(text) : {}),
+    });
     return true;
   };
 

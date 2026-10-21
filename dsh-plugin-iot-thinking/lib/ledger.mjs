@@ -1,13 +1,4 @@
-// lib/ledger.mjs — observability and original-thinking archive.
-//
-// dsh does not guarantee that a plugin's logger.info reaches the launch log, and
-// a failed hook can be silent. This ledger is the only reliable evidence that a
-// reasoning block was actually intercepted and compressed.
-//
-// Originals: dsh stores whatever chunks the llm/stream waterfall yields. Once we
-// replace the reasoning block, the original draft exists nowhere in the session
-// log. Archive it here before replacing, so a bad compression can be audited or
-// replayed later.
+// 账本 + 原文归档。插件没有别的可靠证据：替换后原文只存在于 originals/。
 
 import { appendFileSync, mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from "node:fs";
 import { join } from "node:path";
@@ -59,16 +50,20 @@ export function tailEvents(limit = 20) {
  * Persist one original reasoning block before it is replaced in the stream.
  * @returns {string|null} the archived path, or null when archiving failed.
  */
-export function archiveOriginal({ sessionId, index, text, provider, model }) {
+export function archiveOriginal({ sessionId, index, text, provider, model, strategy, style }) {
   try {
     const dir = join(dataDir(), "originals", safeId(sessionId));
     mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const file = join(dir, `${stamp}-block${Number.isInteger(index) ? index : 0}.txt`);
+    // 头里写清"当时是哪个策略 / 哪份规格"：事后要判断"是改写坏了，还是规格本来就不对"，
+    // 只有原文不够 —— 得知道是谁改的。
     const header = [
       `session=${sessionId ?? ""}`,
       `provider=${provider ?? ""}`,
       `model=${model ?? ""}`,
+      ...(strategy ? [`strategy=${strategy}`] : []),
+      ...(style ? [`style=${style}`] : []),
       `chars=${text.length}`,
       "",
     ].join("\n");

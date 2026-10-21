@@ -1,10 +1,5 @@
-// lib/compress.mjs — auxiliary model call(s) that turn a reasoning draft into
-// the IoT item chain, with a degeneration gate, one strict retry, and a local
-// deterministic fallback.
-//
-// This call is hand-built, so it is NOT marked by dsh-agent-loop. The llm/stream
-// waterfall checks isAgentLoopRequest(options) and therefore lets this call pass
-// through untouched: no recursion, no compressing the compressor.
+// 改写引擎：只负责调用、失败分类、重试、记账；怎么改写全在 lib/strategies.mjs。
+// 这次调用是手工构造的，不会被标成 agent-loop 请求，所以不会递归改写自己。
 
 import {
   AUTO_EFFORT,
@@ -15,39 +10,17 @@ import {
   planKey,
   rememberEffortPlan,
 } from "./effort.mjs";
-import {
-  buildCompressionPrompt,
-  fallbackItems,
-  formatNodes,
-  isDegenerateDraft,
-  isDegenerateItems,
-  sanitizeDraft,
-} from "./think.mjs";
+import { DEFAULT_STRATEGY, limitsOf, strategyById } from "./strategies.mjs";
 
-/**
- * A compressed item chain plus the ledger payload for it.
- *
- * The payload is not written here: only `lib/stream.mjs` knows whether the block
- * is actually replaced or kept, and `thinking-compressed` must carry that answer
- * (`replaced: true|false`) so a compression ratio read from the ledger is not
- * inflated by blocks that were ultimately thrown away (issue #1, problem 3).
- *
- * @param {string} text - the item chain that stream.mjs may substitute.
- * @param {object} payload - the ledger fields for this attempt.
- * @returns {{ text: string, event: object }}
- */
-function compressed(text, payload) {
+/** 改写结果 + 账本载荷。是否真的替换由 stream.mjs 判定后写进 replaced。 */
+function rewritten(text, payload) {
   return { text, event: payload };
 }
 
-/**
- * A route's catalog lookup is advisory, so it must never be able to stall a
- * response: the reasoning block already ended and the reader is waiting. Tests
- * lower this to keep the timeout path fast.
- */
+/** 目录查询只是建议，不能卡住响应；测试会调小它。 */
 export const EFFORT_PROBE = { timeoutMs: 3000 };
 
-/** Reject after `timeoutMs` without leaving the timer holding the process open. */
+/** 超时即拒，且不留下挂住的 timer。 */
 function withTimeout(promise, timeoutMs, label) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
@@ -65,49 +38,60 @@ function withTimeout(promise, timeoutMs, label) {
   });
 }
 
-/**
- * @param {object} args
- * @param {object} args.Llm - namespace from @deepseek-ai/dsh-llm
- * @param {object} args.ctx - plugin context (ctx.llm)
- * @param {string} args.text - original reasoning draft
- * @param {object} args.options - the outer GenerateOptions
- * @param {object} args.cfg - live config
- * @param {number} args.index - reasoning block index
- * @param {(info:object)=>string|null} args.archive - original-draft archiver
- * @param {(event:string,payload?:object)=>void} args.mark - ledger writer
- * @returns {Promise<{ text: string, event: object }|null>} item chain plus its ledger payload, or null to keep the original
- */
-export async function compressThinking({ Llm, ctx, text, options, cfg, index, archive, mark }) {
+/** cfg 是 resolveConfig 的结果（strategy / limits / route 已就位）。返回 null 表示保留原文。 */
+export async function compressThinking({ Llm, ctx, text, options, cfg, index, extra, archive, mark }) {
   const started = Date.now();
   const provider = cfg.provider || options.provider;
   const model = cfg.model || options.model;
-  const profile = cfg.profile ?? "full";
+  const strategy = strategyById(cfg.strategy) ?? strategyById(DEFAULT_STRATEGY);
+  const limits = cfg.limits ?? limitsOf(strategy.id, cfg.strategies?.[strategy.id]);
+  const recent = Array.isArray(extra?.recent) ? extra.recent : [];
 
   if (!provider || !model) {
-    mark("thinking-skipped", { index, reason: "no-route" });
+    mark("thinking-skipped", { index, strategy: strategy.id, reason: "no-route" });
     return null;
   }
 
-  const maxChars = Number.isFinite(cfg.maxChars) ? Math.max(1, cfg.maxChars) : 24000;
+  const maxChars = Number.isFinite(limits.maxChars) ? Math.max(1, limits.maxChars) : 24000;
   if (text.length > maxChars) {
-    mark("thinking-skipped", { index, reason: "above-max-chars", chars: text.length, maxChars });
+    mark("thinking-skipped", { index, strategy: strategy.id, reason: "above-max-chars", chars: text.length, maxChars });
     return null;
   }
 
-  const archived = cfg.archive === false ? null : archive({ sessionId: options.sessionId, index, text, provider, model });
-  const maxTokens = Number.isFinite(cfg.maxTokens) ? Math.max(1, cfg.maxTokens) : 2000;
+  // 策略准备失败就保留原文并记账，不降级去跑别的档位。
+  const prepared = strategy.prepare(limits);
+  if (prepared?.error) {
+    mark("thinking-skipped", { index, strategy: strategy.id, reason: "strategy-unusable", detail: prepared.error });
+    return null;
+  }
+  const state = prepared?.state ?? null;
 
-  // Which reasoning level to ask for. "auto" is the only value that works on
-  // every route without configuration: it starts from `off` and learns from the
-  // route's own refusal (issue #3).
+  const archived =
+    cfg.archive === false
+      ? null
+      : archive({
+          sessionId: options.sessionId,
+          index,
+          text,
+          provider,
+          model,
+          strategy: strategy.id,
+          // 预设文件路径也进归档头，便于事后区分"改写坏了"还是"预设不对"。
+          ...(state?.path ? { style: state.path } : {}),
+        });
+
+  const maxTokens = Number.isFinite(limits.maxTokens) ? Math.max(1, limits.maxTokens) : 2000;
+  const temperature = Number.isFinite(limits.temperature) ? limits.temperature : 0.2;
+
+  // auto：先试 off，被拒则按路由公开的档位降级。
   const mode = normalizeEffort(cfg.reasoningEffort) ?? AUTO_EFFORT;
   const key = planKey(provider, model, mode);
-  /** Effort id carried by the last attempt; null = the field was omitted. */
+  /** 最后一次实际发出的档位；null = 没发这个字段。 */
   let effortSent = null;
   let effortFallback = false;
   let called = false;
 
-  const run = async (instruction, temperature, effort) => {
+  const run = async (instruction, temperatureForCall, effort) => {
     const assembler = new Llm.BlockAssembler();
     effortSent = effort;
     called = true;
@@ -115,14 +99,9 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
       const stream = ctx.llm.stream({
         provider,
         model,
-        // Omitting the field hands the level choice to the adapter's own default,
-        // which is what a route that refuses `off` needs. `off` stays the fast
-        // path: it stops the compressor from spending the output budget on its
-        // own thinking (DeepSeek maps it to thinking:{type:"disabled"}).
+        // 不发字段 = 交给适配器默认值；off 仍是快路径（不花预算在自己的思考上）。
         ...(effort === null ? {} : { reasoningEffort: effort }),
-        // Low temperature makes the flash compressor much less likely to fall
-        // into a one-word repetition loop.
-        temperature,
+        temperature: temperatureForCall,
         messages: [
           Llm.createUserMessage({
             content: [{ type: "text", text: instruction }],
@@ -131,8 +110,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
         ],
         maxTokens,
         sessionId: options.sessionId,
-        // Auxiliary call: a valid GenerateOptions purpose. This request is not an
-        // agent-loop request, so our own waterfall ignores it.
+        // 辅助调用：合法的 purpose，且不是 agent-loop 请求，所以自己的钩子会忽略它。
         purpose: "compaction",
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
@@ -148,13 +126,10 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     if (finish && finish.kind === "error") {
       return { error: finish.failure?.message ?? "unknown", code: finish.failure?.code, finish };
     }
-    // An aborted call is NOT success. dsh normalizes it to `finish.kind:"aborted"`
-    // with no output; treating that as an empty (hence degenerate) answer would
-    // replace a perfectly good thinking block with the deterministic stub just
-    // because the user pressed Esc or the turn timed out.
+    // 中断不是成功：当成"空输出"会把好块换成兜底内容。
     if (finish && finish.kind === "aborted") {
       return {
-        error: finish.failure?.message ?? "compressor call aborted",
+        error: finish.failure?.message ?? "rewriter call aborted",
         code: finish.failure?.code ?? "ABORTED",
         finish,
       };
@@ -168,7 +143,7 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
   };
 
   /**
-   * Ask the exact route which effort levels it advertises, so the compressor can
+   * Ask the exact route which effort levels it advertises, so the rewriter can
    * keep thinking off (or nearly off) on routes that simply do not accept `off`.
    * Purely advisory: an unavailable or slow catalog never fails the block, and a
    * failed probe is reported as *unknown* rather than as "this route has no low
@@ -195,14 +170,14 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
   };
 
   /**
-   * One compressor attempt, including the effort-level recovery. The recovery is
-   * not a retry of a failed compression: the request never reached the provider,
+   * One rewriter attempt, including the effort-level recovery. The recovery is
+   * not a retry of a failed rewrite: the request never reached the provider,
    * so it costs one local round-trip, and an answered route decision is cached.
    */
-  const attempt = async (instruction, temperature, stage) => {
+  const attempt = async (instruction, temperatureForCall, stage) => {
     const known = knownEffortPlan(key);
     const send = known !== undefined ? known : mode === AUTO_EFFORT ? "off" : mode;
-    let result = await run(instruction, temperature, send);
+    let result = await run(instruction, temperatureForCall, send);
     if (!result.error || !isUnsupportedEffortFailure(result)) return result;
 
     // `null` means "send no effort at all". If even that is refused, the adapter's
@@ -235,14 +210,14 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     // pick some other level: send nothing and let the provider decide.
     const probe = mode === AUTO_EFFORT && send === "off" ? await probeLowEffort() : { answered: true, effort: null };
     let chosen = probe.effort;
-    result = await run(instruction, temperature, chosen);
+    result = await run(instruction, temperatureForCall, chosen);
     effortFallback = true;
     // An adapter can advertise a level the host then refuses anyway (stale or
     // optimistic catalog). Omitting the field is the remaining option, so try it
     // once instead of leaving the route pinned on a level that fails every block.
     if (probe.answered && chosen !== null && isUnsupportedEffortFailure(result)) {
       chosen = null;
-      result = await run(instruction, temperature, chosen);
+      result = await run(instruction, temperatureForCall, chosen);
     }
     // "No field at all" refused is the adapter's own default being unadvertised —
     // nothing this plugin can send will work. Name it, and do not cache it: the
@@ -263,138 +238,160 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     return result;
   };
 
-  const payload = (extra) => ({
+  const payload = (fields) => ({
     index,
     provider,
     model,
-    profile,
+    strategy: strategy.id,
     // `effort: null` is meaningful only after a call went out (the field was
-    // omitted); a degenerate input that never called the model has no effort.
+    // omitted); a draft skipped before the model has no effort.
     ...(called ? { effort: effortSent } : {}),
     ...(effortFallback ? { effortFallback: true } : {}),
     charsIn: text.length,
     ms: Date.now() - started,
     archived,
-    ...extra,
+    ...fields,
   });
 
-  const fallback = () => {
-    const items = fallbackItems(text);
-    return items && items.length < text.length ? items : null;
-  };
+  const finishFields = (finish, fields) => ({
+    finish: finish?.kind,
+    truncated: finish?.kind === "max-tokens",
+    ...fields,
+  });
 
-  // A draft that is already a word loop is not worth a model call: sanitize
-  // cannot recover it, and sending it back to the compressor reproduces the loop.
-  if (isDegenerateDraft(text) || !sanitizeDraft(text).trim()) {
-    const items = fallback();
-    if (items) {
-      mark("thinking-degenerate", { index, stage: "input", chars: text.length, charsOut: items.length, action: "fallback" });
-      return compressed(
-        items,
-        payload({ charsOut: items.length, finish: "degenerate-input", truncated: false, retried: false, fallback: true }),
-      );
+  /**
+   * 一次「调用 + 判定」。返回 `{ done: true, value }` 表示已有结论（成功或不重试的失败），
+   * `{ done: false, reason, detail }` 表示"不合格，可以按原因重试一次"。
+   */
+  const pass = async ({ strict, reason, detail, stage, temperatureForCall }) => {
+    const instruction = strategy.buildPrompt(text, { strict, reason, detail, limits, state });
+    if (!instruction) {
+      mark("thinking-skipped", { index, strategy: strategy.id, reason: "no-prompt", stage });
+      return { done: true, value: null };
     }
-    mark("thinking-degenerate", { index, stage: "input", chars: text.length, action: "skip" });
-    return null;
-  }
-
-  const first = await attempt(buildCompressionPrompt(text, { profile }), 0.2, "first");
-  if (first.error) {
-    // 用户按 Esc / 请求超时不是插件的失败：记 skipped 而不是 failed，免得设置卡
-    // 因为一次主动取消就弹"压缩一直失败"。
-    if (first.code === "ABORTED") {
-      mark("thinking-skipped", { index, reason: "aborted", stage: "first", chars: text.length });
-      return null;
-    }
-    mark("thinking-failed", {
-      index,
-      provider,
-      model,
-      ms: Date.now() - started,
-      message: first.error,
-      code: first.code,
-      stage: "first",
-    });
-    return null;
-  }
-
-  const firstRawDegenerate = isDegenerateItems(first.output);
-  let items = formatNodes(first.output, { profile, maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
-  let lastFinish = first.finish;
-  let retried = false;
-
-  if (firstRawDegenerate || !items || isDegenerateItems(items)) {
-    mark("thinking-degenerate", {
-      index,
-      stage: "output",
-      charsIn: text.length,
-      charsOut: items.length,
-      action: "retry",
-      finish: first.finish?.kind,
-    });
-    retried = true;
-    const second = await attempt(buildCompressionPrompt(text, { profile, strict: true }), 0.1, "retry");
-    if (second.error) {
-      if (second.code === "ABORTED") {
-        mark("thinking-skipped", { index, reason: "aborted", stage: "retry", chars: text.length });
-        return null;
+    const result = await attempt(instruction, temperatureForCall, stage);
+    if (result.error) {
+      // Esc/超时记 skipped，不算失败。
+      if (result.code === "ABORTED") {
+        mark("thinking-skipped", { index, strategy: strategy.id, reason: "aborted", stage, chars: text.length });
+        return { done: true, value: null };
       }
       mark("thinking-failed", {
         index,
         provider,
         model,
+        strategy: strategy.id,
         ms: Date.now() - started,
-        message: second.error,
-        code: second.code,
-        stage: "retry",
+        message: result.error,
+        code: result.code,
+        stage,
       });
-      // 失败就回原文：压缩器没给出结果（报错/中止）时拿兜底节点替换正文，
-      // 等于把"没压成"降级成"内容被砍成两句"——那比不压糟。
-      return null;
+      return { done: true, value: null };
     }
-    const secondRawDegenerate = isDegenerateItems(second.output);
-    items = formatNodes(second.output, { profile, maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
-    lastFinish = second.finish;
 
-    if (secondRawDegenerate || !items || isDegenerateItems(items)) {
-      const itemsFallback = fallback();
-      if (itemsFallback) {
-        mark("thinking-degenerate", {
-          index,
-          stage: "output",
-          charsIn: text.length,
-          charsOut: itemsFallback.length,
-          action: "fallback",
-          retried,
-        });
-        return compressed(
-          itemsFallback,
-          payload({
-            charsOut: itemsFallback.length,
-            finish: lastFinish?.kind,
-            truncated: lastFinish?.kind === "max-tokens",
-            retried,
-            fallback: true,
-          }),
-        );
-      }
-      mark("thinking-degenerate", { index, stage: "output", charsIn: text.length, action: "skip", retried });
-      return null;
+    const verdict = strategy.finalize(result.output, { original: text, limits, state, recent });
+    if (verdict.ok) {
+      // 防御：档位没回 text 时（自定义预设早期版本就这样）退回原始输出，不在这里抛。
+      const out = typeof verdict.text === "string" ? verdict.text : String(result.output ?? "").trim();
+      return {
+        done: true,
+        value: rewritten(out, payload(finishFields(result.finish, { charsOut: out.length, retried: strict, ...strategy.metrics?.(out) }))),
+      };
     }
-  }
+    return { done: false, reason: verdict.reason ?? "rejected", detail: verdict.detail ?? null, finish: result.finish };
+  };
 
-  if (!items) {
-    mark("thinking-failed", { index, provider, model, ms: Date.now() - started, message: "empty-output" });
+  // 这段草稿值不值得跑 —— 由策略说。items 说"已经在重复的草稿不值得一次模型调用"，
+  // voice 说"空草稿不值得"，off 永远说"不值得"。
+  const skip = strategy.skipInput(text);
+  if (skip) {
+    // `degenerate-input` 是既有账本词汇（设置卡与审计脚本都在认它），
+    // 其余跳过原因走 thinking-skipped，别把两种性质混进同一个事件。
+    const skipEvent = skip === "degenerate-input" ? "thinking-degenerate" : "thinking-skipped";
+    const fallbackText = strategy.fallback?.(text) ?? null;
+    if (fallbackText) {
+      mark(skipEvent, {
+        index,
+        strategy: strategy.id,
+        stage: "input",
+        chars: text.length,
+        charsOut: fallbackText.length,
+        action: "fallback",
+      });
+      return rewritten(
+        fallbackText,
+        payload({
+          charsOut: fallbackText.length,
+          ...finishFields(null, { finish: skip, truncated: false, retried: false, fallback: true }),
+        }),
+      );
+    }
+    mark(skipEvent, { index, strategy: strategy.id, reason: skip, stage: "input", chars: text.length, action: "skip" });
     return null;
   }
 
-  return compressed(
-    items,
-    payload({
-      charsOut: items.length,
-      finish: lastFinish?.kind,
-      truncated: lastFinish?.kind === "max-tokens",
-      retried,
-    }),
-  );
+  const first = await pass({ strict: false, reason: null, detail: null, stage: "first", temperatureForCall: temperature });
+  if (first.done) return first.value;
+
+  // 不合格：按策略给的原因重试一次（更低温、带针对性指令）。
+  // 事件名由策略决定：items 沿用 thinking-degenerate（历史账本与审计脚本认它），
+  // prose 用 thinking-rejected（被拒的原因不止退化）。
+  const retryEvent = strategy.retryEvent ?? "thinking-rejected";
+  mark(retryEvent, {
+    index,
+    strategy: strategy.id,
+    reason: first.reason,
+    detail: first.detail,
+    stage: "output",
+    action: "retry",
+    charsIn: text.length,
+  });
+  const second = await pass({
+    strict: true,
+    reason: first.reason,
+    detail: first.detail,
+    stage: "retry",
+    temperatureForCall: Math.max(0.05, temperature / 2),
+  });
+  if (second.done) {
+    // 重试本身没拿到结果（报错/中止）：回原文。改写器没给出结果时拿兜底内容
+    // 替换正文，等于把"没改好"降级成"内容被砍成两句"——那比不改糟。
+    return second.value;
+  }
+
+  // 两次都不过：items 家族有确定性兜底（宁可给两条真节点，也不把循环写回会话）；
+  // prose 家族没有兜底 —— 一段编造的内心比不转写糟得多。
+  const fallbackText = strategy.fallback?.(text) ?? null;
+  if (fallbackText) {
+    mark("thinking-degenerate", {
+      index,
+      strategy: strategy.id,
+      stage: "output",
+      charsIn: text.length,
+      charsOut: fallbackText.length,
+      action: "fallback",
+      reason: second.reason,
+      detail: second.detail,
+      retried: true,
+    });
+    return rewritten(
+      fallbackText,
+      payload({
+        charsOut: fallbackText.length,
+        ...finishFields(second.finish, { retried: true, fallback: true }),
+      }),
+    );
+  }
+  mark(retryEvent, {
+    index,
+    strategy: strategy.id,
+    reason: second.reason,
+    detail: second.detail,
+    stage: "output",
+    action: "skip",
+    retried: true,
+    charsIn: text.length,
+  });
+  mark("block-kept", { index, strategy: strategy.id, charsIn: text.length, reason: second.reason ?? "rejected" });
+  return null;
 }

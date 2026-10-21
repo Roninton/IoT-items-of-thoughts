@@ -157,6 +157,8 @@ const ctx = {
       })();
     },
   },
+  // 没有 agentPresets 服务（headless 组合就是这样）：/api/presets 必须答
+  // `available: false` 而不是 500，卡片据此退化成手输 id。
   get: (name) => (name === "webServer" ? webServer : undefined),
   effect: () => {},
   inject: () => {},
@@ -165,7 +167,7 @@ const ctx = {
 ctx.on = (event, handler) => hooks.set(event, handler);
 
 plugin.apply(ctx, {});
-for (const path of ["/iot-thinking/api/config", "/iot-thinking/api/status", "/iot-thinking/api/models", "/iot-thinking/api/test"]) {
+for (const path of ["/iot-thinking/api/config", "/iot-thinking/api/status", "/iot-thinking/api/models", "/iot-thinking/api/test", "/iot-thinking/api/session", "/iot-thinking/api/presets"]) {
   assert.ok(routes.has(path), `${path} registered`);
 }
 const streamHook = hooks.get("llm/stream");
@@ -214,7 +216,7 @@ const events = readFileSync(ledger, "utf8")
   .map((line) => JSON.parse(line));
 assert.ok(events.some((entry) => entry.event === "constructed"));
 assert.ok(events.some((entry) => entry.event === "thinking-effort-fallback" && entry.requested === "off"));
-const compressed = events.find((entry) => entry.event === "thinking-compressed");
+const compressed = events.find((entry) => entry.event === "thinking-rewritten");
 assert.ok(compressed, "thinking-compressed recorded");
 assert.equal(compressed.replaced, true);
 assert.equal(compressed.effort, "low");
@@ -310,11 +312,12 @@ assert.ok(!("path" in status.payload.config), "config path stays off the wire");
     return react;
   });
   assert.equal(Array.from(client.inject).join(","), "slots");
-  let registered = null;
+  /** 两个入口都要注册：设置卡 + 会话头部下拉。 */
+  const registered = [];
   const slots = {
     inject: (_name, factory) => factory(),
     register: (descriptor, component) => {
-      registered = { descriptor, component };
+      registered.push({ descriptor, component });
       return () => {};
     },
   };
@@ -322,10 +325,34 @@ assert.ok(!("path" in status.payload.config), "config path stays off the wire");
     get: (name) => (name === "slots" ? slots : undefined),
     effect: (fn) => fn(),
   });
-  assert.ok(registered, "settings tab registered");
-  assert.equal(registered.descriptor.id, "iot-thinking");
-  assert.equal(typeof registered.component, "function");
-  const tree = registered.component({});
+  const card = registered.find((entry) => entry.descriptor.id === "iot-thinking");
+  assert.ok(card, "settings tab registered");
+  assert.equal(card.descriptor.name, "settings.plugins.tab");
+  assert.equal(typeof card.component, "function");
+  const seat = registered.find((entry) => entry.descriptor.id === "iot-strategy");
+  assert.ok(seat, "session header strategy seat registered");
+  assert.equal(seat.descriptor.name, "conversation.session.header.actions");
+  // 顶栏那一行默认**不渲染**（sessionSwitch 默认关）：拿不到状态时静默，
+  // 拿到状态但开关关着时也静默。开关打开后的渲染由 selftest 的
+  // 「头部下拉默认关闭」用例与卡片的渲染验证覆盖（这里没有 fetch/effect 环境）。
+  assert.equal(seat.component({ sessionId: "s-1" }), null, "default off");
+  assert.equal(seat.component({}), null, "no state yet");
+  // 保存只提交改动过的字段：整份 PUT 会把加载时的 sessions 快照写回去。
+  // 跨 realm 的对象原型不同，用 JSON 比结构。
+  const asJson = (value) => JSON.stringify(value);
+  assert.equal(asJson(client.changedFields({ a: 1, b: 2 }, { a: 1, b: 1 })), asJson({ b: 2 }));
+  assert.equal(asJson(client.changedFields({ a: 1 }, null)), asJson({ a: 1 }), "第一次保存走全量");
+  assert.equal(asJson(client.changedFields({ a: [1, 2] }, { a: [1, 2] })), "{}", "值相同就不提交");
+  // 新建预设后，下拉第二级要立刻能看到它（不用重进设置页）。
+  const options = client.presetOptions([{ name: "a.md", bytes: 10 }, { name: "b.txt", bytes: 20 }], true);
+  assert.equal(asJson(options), asJson([
+    { value: "custom", label: "贴入的文本", bytes: null },
+    { value: "custom:a.md", label: "a.md", bytes: 10 },
+    { value: "custom:b.txt", label: "b.txt", bytes: 20 },
+  ]));
+  assert.equal(asJson(client.presetOptions([], false)), "[]", "没有文件也没有贴入文本时为空");
+  assert.equal(asJson(client.presetOptions(null, true)), asJson([{ value: "custom", label: "贴入的文本", bytes: null }]));
+  const tree = card.component({});
   assert.ok(tree && typeof tree.type === "string", "card renders while loading");
 }
 

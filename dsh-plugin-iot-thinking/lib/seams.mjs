@@ -1,32 +1,9 @@
-// lib/seams.mjs — 从宿主 dsh 安装锚点解析 seam 包（绝对 file:// URL 导入）
-//
-// 为什么必须这么绕（harness-evolve/knowledge/harness-debug.md 实证）：
-//   profile 本地文件插件（name 以 `.` 开头）由 loader 用 Node 原生 import() 加载，
-//   其内部的裸 `@deepseek-ai/*` **不会**走宿主 anchor 回退 → ERR_MODULE_NOT_FOUND。
-//   按绝对路径导入还能与宿主共享同一个模块缓存，避免 Service/instanceof 分裂
-//   （分裂的后果是 "ctx.compaction 已经有人注册" 或类型判断失效）。
-//
-// 锚点顺序：env IOT_DSH_SEAM_ANCHORS（按 path.delimiter 分隔，追加在前）
-//   → $DSH_HOME/profiles/node_modules
-//   → 从 process.argv[1]（宿主入口）上溯出的 node_modules
-//   → $DSH_HOME 下版本化安装 dsh-<ver>/node_modules（按 mtime 降序）
-//   → 安装根 / npm 全局 / 传统 Linux 路径。
-
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execSync } from "node:child_process";
 
-/**
- * 从入口脚本路径上溯出 node_modules 根。
- * 取**最后一层** node_modules：pnpm 的 `<nm>/.pnpm/<pkg>@<ver>/node_modules/<pkg>/...`
- * 只有最里层才真的放得下 @deepseek-ai/*。
- *
- *   <DSH_HOME>/dsh-0.2.1-rc.2/node_modules/@deepseek-ai/dsh/lib/bin.js
- *     -> <DSH_HOME>/dsh-0.2.1-rc.2/node_modules
- *
- * 纯字符串处理（两种分隔符都认），所以自测能直接喂任意平台的假路径。
- */
+/** 入口路径 → node_modules 根。取最后一层（pnpm 嵌套时只有最里层放得下 @deepseek-ai/*）。 */
 export function rootFromEntryPath(entry) {
   if (typeof entry !== "string" || !entry) return null;
   const re = /[\\/]node_modules(?=[\\/]|$)/gi;
@@ -36,11 +13,7 @@ export function rootFromEntryPath(entry) {
   return entry.slice(0, last.index) + last[0][0] + "node_modules";
 }
 
-/**
- * $DSH_HOME 下的版本化安装：`dsh-<ver>/node_modules`。
- * 多版本共存时按目录 mtime 降序 —— 刚装上的那个先试。
- * fs 可注入，自测不必真建目录。
- */
+/** $DSH_HOME/dsh-<ver>/node_modules，按 mtime 降序（刚装上的先试）。 */
 export function versionedRoots(home, fs = { readdirSync, statSync }) {
   if (typeof home !== "string" || !home) return [];
   let entries = [];
@@ -66,28 +39,20 @@ export function versionedRoots(home, fs = { readdirSync, statSync }) {
 }
 
 /**
- * 宿主 node_modules 候选根，按可信度排序。
- *
- * 顺序是语义，不是风格：`profiles/node_modules` 里可能 hoist 着另一个 dsh
- * 版本的 `@deepseek-ai/dsh-llm`，先命中它等于让插件与宿主拿到两份不同实例的
- * seam（Service/instanceof 会分裂）。所以"正在跑的入口"永远排第一，profile 根
- * 只在入口推导落空时用。
- *
- * fs / entry / home 可注入，自测不必真建目录、也不必改 process。
+ * 候选根按可信度排序：正在跑的入口必须排第一，否则可能拿到另一个 dsh 版本的
+ * @deepseek-ai/*，导致 Service/instanceof 分裂。
  */
 export function defaultNodeModulesRoots({ entry = process.argv[1], home = process.env.DSH_HOME, fs } = {}) {
   const roots = [];
   const push = (p) => { if (p && !roots.includes(p)) roots.push(p); };
 
-  // 1) 正在跑的宿主入口 —— 唯一"确定就是当前这个 dsh"的锚点。
-  //    issue #1：旧候选表全是 profiles/全局/系统路径，五个全部落空 → importSeam
-  //    抛错 → cordis 把这条 entry 静默跳过（只留一行 warning），thinking 完全没被压缩。
+  // 1) 正在跑的宿主入口（唯一确定"就是这个 dsh"的锚点）
   push(rootFromEntryPath(entry));
 
-  // 2) profile 解析根。只在入口推导落空时使用：它可能装着别的 dsh 版本的副本。
+  // 2) profile 解析根（可能装着别的 dsh 版本）
   if (home) push(join(home, "profiles", "node_modules"));
 
-  // 3) 兜底：扫 DSH_HOME 下的版本化安装（入口被 wrapper 改写、argv[1] 不可用时）
+  // 3) DSH_HOME 下的版本化安装
   if (home) for (const r of versionedRoots(home, fs)) push(r);
 
   // 4) 安装根

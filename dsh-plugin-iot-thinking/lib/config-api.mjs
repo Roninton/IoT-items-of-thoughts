@@ -1,26 +1,17 @@
-// lib/config-api.mjs — browser bridge for the Settings card.
+// 设置卡 / 头部下拉的 HTTP 桥（挂在 ctx.webServer 上）。
 //
-// Static client bundles cannot extend the typert remote catalog, so the plugin
-// uses the same channel as context-memory: an exact HTTP route on ctx.webServer
-// plus a same-origin fetch from the client half. dsh web binds to 127.0.0.1.
+// 门禁（宿主不做鉴权，所以每条 handler 自己守）：自定义头 x-iot-thinking、
+// 同源（Sec-Fetch-Site / Origin==Host）、默认只收 loopback 对端
+// （IOT_THINKING_ALLOW_REMOTE=1 可放开）。不加这些，一个未授权的 PUT 就能改路由
+// 并把 thinking 发到别处，GET 还会漏配置路径与会话 id。
 //
-// THREAT MODEL (review #01a153e4-75e4, "harmful"): these routes are reachable
-// from anything that can speak HTTP to the port, and nothing upstream
-// authenticates them — the host webserver only keeps a route table. So the
-// handlers guard themselves:
-//   * a custom request header the UI sets and a cross-site page cannot set
-//     without a preflight this server refuses (no CORS approval is ever sent);
-//   * same-origin checks on Origin / Sec-Fetch-Site / Host so a DNS-rebinding
-//     page (same origin after rebind) and a LAN peer are both refused;
-//   * loopback and same-host peers only, unless the operator set IOT_THINKING_ALLOW_REMOTE=1.
-// Without this, an unauthenticated PUT rewrites provider/model and every
-// reasoning block is streamed to the attacker's endpoint (F1), and GET leaks
-// the config path plus session ids from the ledger (F2).
+// 路由：config GET/PUT、status、models、test、session GET/PUT、presets、strategy、preset-dir。
 
 import { normalizeEffort } from "./effort.mjs";
 import { tailEvents } from "./ledger.mjs";
-import { isShorterReplacement } from "./stream.mjs";
-import { PROFILES } from "./think.mjs";
+import { strategyById, strategyIds } from "./strategies.mjs";
+import { normalizeRouteEntry, resolveConfig, strategyCatalog } from "./route.mjs";
+import { listPresets, readPreset, writePreset } from "./custom.mjs";
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -43,7 +34,7 @@ const SELF_TEST_TIMEOUT_MS = 60000;
 /**
  * A draft the self-test can compress when the card does not supply one. It is
  * ordinary coding-session reasoning: a decision, a rejected route, an open
- * question, and a next step, so every profile has something to keep.
+ * question, and a next step, so every strategy has something to keep.
  */
 const SAMPLE_DRAFT = [
   "先看现状：插件是在 llm/stream 上做块级替换，块结束时才压缩，所以客户端会顿一下。",
@@ -106,12 +97,7 @@ export function guardRequest(req) {
   }
 
   if (process.env.IOT_THINKING_ALLOW_REMOTE !== "1") {
-    // The default Web composition binds 127.0.0.1, so a loopback peer is the
-    // UI. A LAN-bound composition (dsh-lan-access) deliberately exposes the
-    // card to the network; the operator opts into that with
-    // IOT_THINKING_ALLOW_REMOTE=1 rather than this code trusting a Host header
-    // (which any client can forge). An absent socket proves nothing, so it is
-    // refused rather than treated as loopback.
+    // 默认只认 loopback 对端（Host 头可伪造）。拿不到 socket 一律拒。
     const remote = req.socket?.remoteAddress;
     const loopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
     if (!loopback) return { ok: false, status: 403, reason: `peer ${String(remote)} is not loopback` };
@@ -140,7 +126,11 @@ export function redactEvents(events) {
       "chars",
       "ms",
       "reason",
+      "strategy",
       "profile",
+      "nodes",
+      "lines",
+      "fragmentRate",
       "retried",
       "fallback",
       "truncated",
@@ -151,6 +141,7 @@ export function redactEvents(events) {
       "effortFallback",
       "requested",
       "action",
+      "detail",
     ]) {
       if (entry[key] !== undefined) row[key] = entry[key];
     }
@@ -190,18 +181,71 @@ function readBody(req) {
   });
 }
 
+/**
+ * 一个"策略值"：合法就收（策略 id 或 `custom` / `custom:名字`），
+ * `null`/空串表示"删掉这一层覆盖"，非法返回 `undefined`（调用方据此 400）。
+ */
+function strategyValue(value) {
+  if (value === null || value === "") return null;
+  const entry = normalizeRouteEntry(value);
+  if (!entry) return undefined;
+  if (entry.id === "custom") return entry.custom ? `custom:${entry.custom}` : "custom";
+  return entry.id;
+}
+
+/**
+ * `{ key: entry | null }` → 一张完整的映射表。
+ *
+ * ⚠️ 这是**整表替换**，不是并集。并集看起来"更安全"（并发编辑不互相抹掉），
+ * 但它让"删除"永远不可能落盘：卡片删掉一行后仍把同一张表 PUT 上来，
+ * 并集会把刚删的那行重新合并回去 —— 用户看到的是"点了删除、保存、一刷新又回来了"。
+ * 表很小、并发编辑很罕见；删除正确性优先。
+ *
+ * 值就是档位名（三档基础模式的 id，或 `custom` / `custom:预设名`）。
+ * `null` 值表示删这一键（单键增量写法仍可用：只发 `{ presetId: null }` 就给这一键）。
+ *
+ * @param {object|null} patch - 请求体里的映射表。
+ * @returns {object} 校验后的完整表。
+ */
+function strategyTable(patch) {
+  const out = {};
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return out;
+  for (const [key, value] of Object.entries(patch)) {
+    if (typeof key !== "string" || !key) continue;
+    const entry = normalizeRouteEntry(value);
+    if (!entry) continue;
+    // 自定义预设要保住名字（那是 presetDir 里的文件名）：存成 `custom:名字`。
+    if (entry.id === "custom") {
+      out[key] = entry.custom ? `custom:${entry.custom}` : "custom";
+      continue;
+    }
+    out[key] = entry.id;
+  }
+  return out;
+}
+
 function sanitize(payload) {
   const next = {};
   if (typeof payload.enabled === "boolean") next.enabled = payload.enabled;
-  if (typeof payload.profile === "string" && Object.hasOwn(PROFILES, payload.profile)) next.profile = payload.profile;
-  if (Number.isFinite(payload.minChars)) next.minChars = Math.max(0, Math.floor(payload.minChars));
+  // 全局默认同样可以是 `custom` / `custom:名字`。
+  const globalEntry = normalizeRouteEntry(payload.strategy);
+  if (globalEntry) {
+    next.strategy = globalEntry.id === "custom"
+      ? globalEntry.custom ? `custom:${globalEntry.custom}` : "custom"
+      : globalEntry.id;
+  }
+  if (payload.agentPresets !== undefined) next.agentPresets = strategyTable(payload.agentPresets);
+  if (payload.sessions !== undefined) next.sessions = strategyTable(payload.sessions);
+  if (payload.strategies !== undefined) next.strategies = payload.strategies;
   if (Number.isFinite(payload.maxChars)) next.maxChars = Math.max(1, Math.floor(payload.maxChars));
-  if (Number.isFinite(payload.maxTokens)) next.maxTokens = Math.max(1, Math.floor(payload.maxTokens));
-  if (Number.isFinite(payload.maxNodes)) next.maxNodes = Math.max(1, Math.floor(payload.maxNodes));
-  if (Number.isFinite(payload.maxNeutral)) next.maxNeutral = Math.max(0, Math.floor(payload.maxNeutral));
   if (typeof payload.archive === "boolean") next.archive = payload.archive;
-  // An unknown level is dropped rather than saved, so the card can never write a
-  // value the compressor would have to guess about. `null` means auto.
+  if (typeof payload.sessionSwitch === "boolean") next.sessionSwitch = payload.sessionSwitch;
+  // 自定义预设三件：目录、贴入的文本、替换规则。
+  if (typeof payload.presetDir === "string") next.presetDir = payload.presetDir.trim();
+  if (typeof payload.customText === "string") next.customText = payload.customText;
+  if (payload.presetAccept === "shorter" || payload.presetAccept === "different") next.presetAccept = payload.presetAccept;
+  // 未知档位不落盘；null 表示 auto。
+
   const effort = normalizeEffort(payload.reasoningEffort);
   if (effort !== null) next.reasoningEffort = effort;
   for (const key of ["provider", "model"]) {
@@ -209,6 +253,32 @@ function sanitize(payload) {
     else if (typeof payload[key] === "string") next[key] = payload[key].trim() || null;
   }
   return next;
+}
+
+/**
+ * 逐策略覆盖的写入：`{ "<strategy id>": { minChars, ... } }`。
+ *
+ * 与顶层字段分开走：顶层 `sanitize` 只认全局项，逐策略的限制是策略相关的，
+ * 在这里校验"键是已知策略、值是对象"，数值字段的合法性留给 engine 兜（它本来就会）。
+ */
+function sanitizeStrategies(payload, current) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return current;
+  const out = { ...(current && typeof current === "object" ? current : {}) };
+  for (const [id, overrides] of Object.entries(payload)) {
+    if (!strategyById(id)) continue;
+    if (overrides === null) {
+      delete out[id];
+      continue;
+    }
+    if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) continue;
+    const next = { ...(out[id] ?? {}) };
+    for (const [key, value] of Object.entries(overrides)) {
+      if (!Number.isFinite(value)) continue;
+      next[key] = Math.max(key === "temperature" || key === "minRatio" ? 0 : 0, value);
+    }
+    out[id] = next;
+  }
+  return out;
 }
 
 /** Reject after `ms` without leaving the timer holding the process open. */
@@ -256,6 +326,102 @@ function describeEfforts(reasoning) {
   };
 }
 
+/**
+ * 两级值域。第一级是档位（三档 + 自定义预设 + 关闭），第二级只在选到自定义预设
+ * 时才有意义（具体用哪份文本）。不把每个预设文件铺进第一级 —— 那会让"档位"这个
+ * 选择题变成一长串文件名。
+ */
+function valueChoices(cfg = {}) {
+  const listing = listPresets(cfg.presetDir);
+  const tiers = strategyCatalog().map((entry) => ({
+    value: entry.id,
+    label: entry.label,
+    family: entry.family,
+    isCustom: entry.family === "custom",
+  }));
+  const presets = [];
+  if (String(cfg.customText ?? "").trim()) {
+    presets.push({ value: "custom", label: "贴入的文本", bytes: null });
+  }
+  for (const preset of listing.presets) {
+    presets.push({ value: `custom:${preset.name}`, label: preset.name, bytes: preset.bytes });
+  }
+  return { tiers, presets, presetDirSet: listing.configured };
+}
+
+/** 会话 id → agent preset（会话投影里的值）。取不到返回 undefined。 */
+function agentPresetOf(ctx, sessionId) {
+  if (!sessionId) return undefined;
+  try {
+    const session = ctx.get?.("sessions")?.get?.(sessionId);
+    if (!session) return undefined;
+    const preset = ctx.get?.("sessionProjections")?.stateOf?.(session, "agentPreset");
+    return typeof preset === "string" && preset ? preset : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 设置卡与头部下拉都要的一份"可选项"。 */
+function catalogPayload(store) {
+  const cfg = store?.load?.() ?? {};
+  const listing = listPresets(cfg.presetDir);
+  return {
+    strategies: strategyCatalog(),
+    ids: strategyIds(),
+    // 自定义预设（第 4 项）：目录、目录里有什么、贴入的那段文本在不在。
+    presetDirSet: listing.configured,
+    presetFiles: listing.presets,
+    hasCustomText: typeof cfg.customText === "string" && cfg.customText.trim().length > 0,
+    presetAccept: cfg.presetAccept === "shorter" ? "shorter" : "different",
+    /** 所有下拉共用的一份"可选值"。 */
+    choices: valueChoices(cfg),
+  };
+}
+
+/**
+ * 一条策略的"原文"：用它自己的 prepare + buildPrompt 渲染一次，
+ * 把**真正会发给模型的那段提示词**摊开给用户看。
+ *
+ * 这不是把代码里的常量贴出来（那样看到的和实际发出的可能不一样：
+ * 三档的标签集合、节点预算、准入判据，以及自定义预设的整段文本，
+ * 全在这段提示词里）。
+ *
+ * @param {{id: string}} wanted - 档位 id。
+ * @returns {{ok: true, prompt: string} | {ok: false, error: string}}
+ */
+function renderStrategyPrompt(wanted, preset = null) {
+  const strategy = strategyById(wanted.id);
+  if (!strategy) return { ok: false, error: `unknown strategy: ${wanted.id}` };
+  const limits = limitsMerge(strategy.id, {});
+  // 自定义预设：把"哪份内容"塞进 limits，与真实请求走同一个 prepare。
+  if (preset) limits.preset = preset;
+  try {
+    const prepared = strategy.prepare(limits);
+    if (prepared?.error) return { ok: false, error: prepared.error };
+    const prompt = strategy.buildPrompt(SAMPLE_DRAFT, {
+      strict: false,
+      reason: null,
+      detail: null,
+      limits,
+      state: prepared?.state ?? null,
+    });
+    return {
+      ok: true,
+      prompt: String(prompt ?? ""),
+    };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/** 只算限制，不读整份配置（预览用）。 */
+function limitsMerge(id, overrides) {
+  const strategy = strategyById(id);
+  if (!strategy) return {};
+  return { ...strategy.defaults, ...(overrides ?? {}) };
+}
+
 function doRegister(ctx, ws, store, deps = {}) {
   const config = async (req, res) => {
     const gate = guardRequest(req);
@@ -269,7 +435,7 @@ function doRegister(ctx, ws, store, deps = {}) {
         // `path` is the user's home directory under $DSH_HOME: keep it out of the
         // wire format (F2), the card never rendered it.
         const { path: _omit, ...safe } = store.load();
-        sendJson(res, 200, { config: safe });
+        sendJson(res, 200, { config: safe, ...catalogPayload(store) });
         return;
       }
       if (req.method === "PUT") {
@@ -295,8 +461,16 @@ function doRegister(ctx, ws, store, deps = {}) {
           sendJson(res, 400, { error: "body must be a JSON object" });
           return;
         }
-        const saved = store.save(sanitize(payload));
-        sendJson(res, 200, { ok: true, config: saved });
+        const current = store.load();
+        const patch = sanitize(payload);
+        // 映射表按**整表替换**落盘：卡片发上来的就是它看到的全表，
+        // 所以"删掉一行 / 清空所有会话覆盖"才能真的落盘（见 strategyTable 的说明）。
+        if (payload.agentPresets !== undefined) patch.agentPresets = strategyTable(payload.agentPresets);
+        if (payload.sessions !== undefined) patch.sessions = strategyTable(payload.sessions);
+        if (payload.strategies !== undefined) patch.strategies = sanitizeStrategies(payload.strategies, current.strategies);
+        const saved = store.save(patch);
+        const { path: _omit, ...safe } = saved;
+        sendJson(res, 200, { ok: true, config: safe });
         return;
       }
       sendJson(res, 405, { error: "method not allowed" });
@@ -321,8 +495,326 @@ function doRegister(ctx, ws, store, deps = {}) {
       return;
     }
     try {
-      const { path: _omit, ...safe } = store.load();
-      sendJson(res, 200, { config: safe, events: redactEvents(tailEvents(25)) });
+      const cfg = store.load();
+      const { path: _omit, ...safe } = cfg;
+      const url = new URL(String(req.url ?? "/"), "http://127.0.0.1");
+      const sessionId = url.searchParams.get("sessionId");
+      const preset = url.searchParams.get("agentPreset");
+      // 卡片要能回答"为什么这个会话现在用的是这一档"：把解析结果与来源一起回。
+      const resolved = sessionId || preset ? resolveConfig(cfg, { sessionId, agentPreset: preset }).route : null;
+      sendJson(res, 200, { config: safe, events: redactEvents(tailEvents(25)), ...catalogPayload(store), resolved });
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  /** 会话级读写：头部下拉与 /iot 命令共用的那一层。 */
+  const session = async (req, res) => {
+    const gate = guardRequest(req);
+    if (!gate.ok) {
+      ctx.logger?.warn?.(`iot-thinking session api refused: ${gate.reason}`);
+      sendJson(res, gate.status, { error: "forbidden" });
+      return;
+    }
+    try {
+      if (req.method === "GET") {
+        const url = new URL(String(req.url ?? "/"), "http://127.0.0.1");
+        const sessionId = url.searchParams.get("sessionId") ?? "";
+        // 前端不一定知道 preset（新会话尤其），所以按会话自己查一次。
+        const agentPreset = url.searchParams.get("agentPreset") ?? agentPresetOf(ctx, sessionId);
+        const cfg = store.load();
+        const effective = resolveConfig(cfg, { sessionId, agentPreset });
+        // 「跟随 preset 默认」要显示的是**没有本会话覆盖时**的结果，
+        // 否则那句标签会把覆盖值说成 preset 默认值。
+        const presetDefault = resolveConfig(cfg, { agentPreset }).route;
+        sendJson(res, 200, {
+          sessionId,
+          agentPreset: agentPreset ?? null,
+          route: effective.route,
+          presetDefault: { id: presetDefault.id, source: presetDefault.source, key: presetDefault.key ?? null },
+          enabled: effective.enabled,
+          /** 头部下拉是否显示（默认关，卡片里可开）。 */
+          sessionSwitch: cfg.sessionSwitch === true,
+          strategies: strategyCatalog(),
+          /** 头部下拉用这一份：内置档位 + 目录里的自定义预设 + 贴入的文本。 */
+          choices: valueChoices(cfg),
+          /** 这个会话自己那条覆盖（没配就是 null）。 */
+          override: cfg.sessions?.[sessionId] ?? null,
+          /** 它所属 preset 的映射（没配就是 null）。 */
+          presetStrategy: agentPreset ? cfg.agentPresets?.[agentPreset] ?? null : null,
+        });
+        return;
+      }
+      if (req.method === "PUT") {
+        let payload;
+        try {
+          const text = await readBody(req);
+          payload = JSON.parse(text);
+        } catch (error) {
+          if (error?.statusCode === 413) {
+            sendJson(res, 413, { error: "request body too large" });
+            return;
+          }
+          sendJson(res, 400, { error: "body must be valid JSON" });
+          return;
+        }
+        if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+          sendJson(res, 400, { error: "body must be a JSON object" });
+          return;
+        }
+        const sessionId = String(payload.sessionId ?? "").trim();
+        if (!sessionId) {
+          sendJson(res, 400, { error: "sessionId is required" });
+          return;
+        }
+        // `strategy` 是档位名（或 `custom[:预设名]`），`null` 表示清除这层覆盖。
+        const cleared = payload.strategy === null || payload.strategy === "";
+        const entry = cleared ? null : normalizeRouteEntry(payload.strategy);
+        if (!cleared && !entry) {
+          sendJson(res, 400, { error: `unknown strategy: ${JSON.stringify(payload.strategy)}` });
+          return;
+        }
+        const cfg = store.load();
+        const sessions = { ...(cfg.sessions ?? {}) };
+        // `null` = 回到"跟随 preset / 全局默认"，这正是"清除本会话覆盖"的语义。
+        if (!entry) delete sessions[sessionId];
+        else if (entry.id === "custom") sessions[sessionId] = entry.custom ? `custom:${entry.custom}` : "custom";
+        else sessions[sessionId] = entry.id;
+        store.save({ sessions });
+        // 前端不一定传 preset；查不到就当"少一层映射"，不影响会话覆盖生效。
+        const preset = payload.agentPreset ?? agentPresetOf(ctx, sessionId);
+        const reloaded = store.load();
+        const effective = resolveConfig(reloaded, { sessionId, agentPreset: preset });
+        const presetDefault = resolveConfig(reloaded, { agentPreset: preset }).route;
+        sendJson(res, 200, {
+          ok: true,
+          sessionId,
+          route: effective.route,
+          presetDefault: { id: presetDefault.id, source: presetDefault.source, key: presetDefault.key ?? null },
+          enabled: effective.enabled,
+          override: sessions[sessionId] ?? null,
+        });
+        return;
+      }
+      sendJson(res, 405, { error: "method not allowed" });
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  /**
+   * Preset 清单（list）与单条组成（detail）。
+   *
+   * 为什么要有这条：设置卡里那张"按 preset 映射"的表如果只能手输 preset id，
+   * 用户就得知道 `standard` / `jingjing` / `local-slim` 这些名字从哪来 ——
+   * 而宿主本来就有清单（`agentPresets.list()`）和组成（`compositionInventory()`）。
+   *
+   * 返回里的 `available: false` 是**正常情况**（headless profile 不挂 preset 服务），
+   * 不是错误：卡片会退化成"手输 id"。
+   */
+  const presets = async (req, res) => {
+    const gate = guardRequest(req);
+    if (!gate.ok) {
+      ctx.logger?.warn?.(`iot-thinking presets api refused: ${gate.reason}`);
+      sendJson(res, gate.status, { error: "forbidden" });
+      return;
+    }
+    if (req.method !== "GET") {
+      sendJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    try {
+      const url = new URL(String(req.url ?? "/"), "http://127.0.0.1");
+      const detailOf = String(url.searchParams.get("detail") ?? "").trim();
+      // `agentPresets` 不是本插件的注入依赖（headless 里根本没有），所以只能试探着拿：
+      // 拿不到是正常情况，卡片会退化成"手输 id"。
+      let registry;
+      try {
+        registry = (typeof ctx.get === "function" ? ctx.get("agentPresets") : undefined) ?? ctx.agentPresets;
+      } catch {
+        registry = undefined;
+      }
+      if (!registry || typeof registry.list !== "function") {
+        sendJson(res, 200, { available: false, presets: [], mapped: {}, reason: "no-agentPresets-service" });
+        return;
+      }
+
+      const rows = await withTimeout(registry.list(), CATALOG_TIMEOUT_MS, "agentPresets.list");
+      const defaultId = typeof registry.defaultId === "string" ? registry.defaultId : null;
+      const cfg = store.load();
+      const mapped = cfg.agentPresets ?? {};
+      const known = new Set(rows.map((row) => row.id));
+
+      let detail = null;
+      if (detailOf) {
+        try {
+          // 组成清单：每行是一个插件行（moduleName + 该行是否启用/是否加载失败）。
+          // 它比整份 YAML 更适合展示 —— 用户问的是"这个 preset 到底是什么"，
+          // 而不是"它的配置原文长什么样"。
+          if (typeof registry.compositionInventory === "function") {
+            const inventory = await withTimeout(registry.compositionInventory(), CATALOG_TIMEOUT_MS, "compositionInventory");
+            const found = inventory.find((entry) => entry.id === detailOf);
+            if (found) {
+              detail = {
+                id: found.id,
+                name: found.name ?? null,
+                description: found.description ?? null,
+                isDefault: found.isDefault === true,
+                broken: found.broken ?? null,
+                rows: (found.rows ?? []).map((row) => ({
+                  entryId: String(row.entryId ?? ""),
+                  moduleName: String(row.moduleName ?? ""),
+                  enabled: row.enabled !== false,
+                  ...(row.condition ? { condition: String(row.condition) } : {}),
+                })),
+              };
+            }
+          }
+        } catch (error) {
+          ctx.logger?.warn?.(`iot-thinking presets api: detail failed: ${String(error?.message ?? error)}`);
+        }
+      }
+
+      sendJson(res, 200, {
+        available: true,
+        defaultPreset: defaultId,
+        presets: rows.map((row) => ({
+          id: row.id,
+          name: row.name ?? null,
+          description: row.description ?? null,
+          isDefault: row.id === defaultId,
+          broken: row.broken ?? null,
+          /** 这个 preset 在配置里被映射到哪个策略；没映射就是 null。 */
+          mappedTo: mapped[row.id] ?? null,
+        })),
+        // 配置里映射了、但当前注册表里不存在的 preset：多半是 preset 被删/改名了。
+        // 卡片要把它们显示出来并标红，否则用户只看到"我的映射不见了"。
+        orphaned: Object.keys(mapped).filter((id) => !known.has(id)),
+        detail,
+      });
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  /**
+   * 一条策略的详情：声明 + **真正会发给模型的提示词原文**。
+   *
+   * 用户问"这两个到底做什么"，只给 label 是不够的 —— 决策档与 research 的差别
+   * 全在提示词里，角色档还会把规格文件的内容拼进去。所以这里直接渲染一次。
+   */
+  const strategyDetail = (req, res) => {
+    const gate = guardRequest(req);
+    if (!gate.ok) {
+      ctx.logger?.warn?.(`iot-thinking strategy api refused: ${gate.reason}`);
+      sendJson(res, gate.status, { error: "forbidden" });
+      return;
+    }
+    if (req.method !== "GET") {
+      sendJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    try {
+      const url = new URL(String(req.url ?? "/"), "http://127.0.0.1");
+      const id = String(url.searchParams.get("id") ?? "").trim();
+      // 自定义预设（第 4 项）：`?id=custom&preset=<名字>` 显示目录里那份，
+      // 不传 preset 就显示贴进来的那段文本。
+      if (id === "custom") {
+        const presetName = String(url.searchParams.get("preset") ?? "").trim();
+        const cfg = store.load();
+        const source = presetName
+          ? readPreset(cfg.presetDir, presetName)
+          : { text: String(cfg.customText ?? ""), error: String(cfg.customText ?? "").trim() ? null : "还没贴入任何文本" };
+        const strategy = strategyById("custom");
+        const rendered = source.text
+          ? renderStrategyPrompt({ id: "custom" }, { preset: presetName ? { name: presetName, dir } : { inline: source.text } })
+          : { ok: false, error: source.error };
+        sendJson(res, 200, {
+          id: "custom",
+          label: strategy.label,
+          summary: strategy.summary,
+          family: strategy.family,
+          accept: cfg.presetAccept === "shorter" ? "shorter" : "different",
+          defaults: { ...strategy.defaults },
+          preset: presetName || null,
+          presetText: source.text,
+          prompt: rendered.ok ? rendered.prompt : null,
+          ...(rendered.ok ? {} : { error: rendered.error }),
+          presetFiles: listPresets(cfg.presetDir).presets,
+        });
+        return;
+      }
+      const strategy = strategyById(id);
+      if (!strategy) {
+        sendJson(res, 404, { error: `unknown strategy: ${id}`, available: strategyIds() });
+        return;
+      }
+      const rendered = renderStrategyPrompt({ id });
+      sendJson(res, 200, {
+        id: strategy.id,
+        label: strategy.label,
+        summary: strategy.summary,
+        family: strategy.family,
+        accept: strategy.accept,
+        defaults: { ...strategy.defaults },
+        prompt: rendered.ok ? rendered.prompt : null,
+        ...(rendered.ok ? {} : { error: rendered.error }),
+      });
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  /** 预设目录：列出 / 读内容 / 另存为。目录必须显式配置，不设默认值。 */
+  const presetDir = async (req, res) => {
+    const gate = guardRequest(req);
+    if (!gate.ok) {
+      ctx.logger?.warn?.(`iot-thinking preset-dir api refused: ${gate.reason}`);
+      sendJson(res, gate.status, { error: "forbidden" });
+      return;
+    }
+    try {
+      const cfg = store.load();
+      const url = new URL(String(req.url ?? "/"), "http://127.0.0.1");
+
+      if (req.method === "GET") {
+        const wanted = url.searchParams.get("read");
+        if (wanted) {
+          const loaded = readPreset(cfg.presetDir, wanted);
+          sendJson(res, 200, { name: wanted, text: loaded.text, ...(loaded.error ? { error: loaded.error } : {}) });
+          return;
+        }
+        const listing = listPresets(cfg.presetDir);
+        sendJson(res, 200, { configured: listing.configured, presets: listing.presets });
+        return;
+      }
+
+      if (req.method === "POST") {
+        let payload;
+        try {
+          payload = JSON.parse(await readBody(req));
+        } catch (error) {
+          if (error?.statusCode === 413) {
+            sendJson(res, 413, { error: "request body too large" });
+            return;
+          }
+          sendJson(res, 400, { error: "body must be valid JSON" });
+          return;
+        }
+        if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+          sendJson(res, 400, { error: "body must be a JSON object" });
+          return;
+        }
+        const written = writePreset(cfg.presetDir, payload.name, payload.text);
+        if (!written.ok) {
+          sendJson(res, 400, { error: written.error });
+          return;
+        }
+        sendJson(res, 200, { ok: true, name: written.name, presets: listPresets(cfg.presetDir).presets });
+        return;
+      }
+
+      sendJson(res, 405, { error: "method not allowed" });
     } catch (error) {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
@@ -391,10 +883,10 @@ function doRegister(ctx, ws, store, deps = {}) {
     });
   };
 
-  // One real compressor call on demand. It runs the same compressThinking the
-  // stream hook runs and applies the same "must be strictly shorter" rule
-  // stream.mjs enforces — a self-test that only checks for a non-empty reply
-  // reports green on a compression that would never be substituted.
+  // One real rewrite call on demand. It runs the same compressThinking the
+  // stream hook runs and applies the same acceptance rule the stream applies —
+  // a self-test that only checks for a non-empty reply reports green on a
+  // rewrite the real link would never substitute.
   const test = async (req, res) => {
     const gate = guardRequest(req);
     if (!gate.ok) {
@@ -406,8 +898,8 @@ function doRegister(ctx, ws, store, deps = {}) {
       sendJson(res, 405, { error: "method not allowed" });
       return;
     }
-    if (typeof deps.compress !== "function") {
-      sendJson(res, 503, { error: "压缩器未接线，无法自测" });
+    if (typeof deps.rewrite !== "function") {
+      sendJson(res, 503, { error: "改写器未接线，无法自测" });
       return;
     }
 
@@ -429,7 +921,17 @@ function doRegister(ctx, ws, store, deps = {}) {
       return;
     }
 
-    const cfg = store.load();
+    // 自测可以针对任一策略：默认测"全局默认那一档"，也可以点名测某档
+    // （改档位之前先验一次，比改完回会话里试便宜）。
+    const wanted = strategyValue(payload.strategy ?? null);
+    const cfgNow = store.load();
+    const requestedId = typeof wanted === "string" ? wanted : null;
+    const scoped = requestedId
+      ? resolveConfig({ ...cfgNow, strategy: requestedId }, { sessionId: payload.sessionId ?? undefined, agentPreset: payload.agentPreset ?? undefined })
+      : resolveConfig(cfgNow, { sessionId: payload.sessionId ?? undefined, agentPreset: payload.agentPreset ?? undefined });
+    const cfg = scoped;
+    const strategy = strategyById(cfg.strategy);
+
     // The card's route fields may be blank ("follow the current request"), and a
     // test has no request to follow. index.mjs records the last agent-loop route
     // for exactly this case.
@@ -439,7 +941,7 @@ function doRegister(ctx, ws, store, deps = {}) {
     if (!provider || !model) {
       sendJson(res, 409, {
         ok: false,
-        error: "还没有可用的压缩路由：在卡片里选一个 provider/model，或先在本会话发一条消息（插件会记住当前请求路由）。",
+        error: "还没有可用的改写路由：在卡片里选一个 provider/model，或先在本会话发一条消息（插件会记住当前请求路由）。",
       });
       return;
     }
@@ -451,9 +953,13 @@ function doRegister(ctx, ws, store, deps = {}) {
     const started = Date.now();
 
     // A test that reports green on input the real link would skip is the false
-    // green this route exists to prevent, so the same two gates apply up front.
+    // green this route exists to prevent, so the same gates apply up front.
+    // 先问策略（为什么这段不该跑），再问长度闸 —— 两者的原因不一样，
+    // 合并成一个 "below-min-chars" 会让卡片撒谎。
+    const skipped = strategy.skipInput?.(input) ?? null;
     let why = null;
     if (cfg.enabled === false) why = "disabled";
+    else if (skipped) why = skipped;
     else if (input.length < minChars) why = "below-min-chars";
     else if (input.length > maxChars) why = "above-max-chars";
     if (why !== null) {
@@ -461,6 +967,7 @@ function doRegister(ctx, ws, store, deps = {}) {
         ok: false,
         replaced: false,
         reason: why,
+        strategy: cfg.strategy,
         provider,
         model,
         charsIn: input.length,
@@ -476,7 +983,7 @@ function doRegister(ctx, ws, store, deps = {}) {
     let result = null;
     try {
       result = await withTimeout(
-        deps.compress(input, { provider, model, sessionId: "iot-thinking-self-test" }, { ...cfg, archive: false }, 0),
+        deps.rewrite(input, { provider, model, sessionId: "iot-thinking-self-test" }, { ...cfg, archive: false }, 0, {}),
         SELF_TEST_TIMEOUT_MS,
         "self-test",
       );
@@ -499,18 +1006,19 @@ function doRegister(ctx, ws, store, deps = {}) {
     const candidate = typeof result === "string" ? result : result?.text;
     const text = typeof candidate === "string" ? candidate.trim() : "";
     // The same rule stream.mjs applies before it may substitute a block.
-    const replaced = isShorterReplacement(input, candidate);
-    const reason = replaced
+    const accepted = strategy.accepts(input, candidate, cfg.limits);
+    const reason = accepted
       ? null
       : result === null
         ? "compressor-failed"
         : text.length === 0
           ? "empty-output"
-          : "not-shorter";
+          : `not-${strategy.accept}`;
     const response = {
-      ok: replaced,
-      replaced,
+      ok: accepted,
+      replaced: accepted,
       reason,
+      strategy: cfg.strategy,
       provider,
       model,
       charsIn: input.length,
@@ -524,7 +1032,7 @@ function doRegister(ctx, ws, store, deps = {}) {
       ...(lastFailure?.message ? { error: String(lastFailure.message) } : {}),
       event: result?.event
         ? {
-            profile: result.event.profile,
+            strategy: result.event.strategy,
             finish: result.event.finish,
             retried: result.event.retried,
             fallback: result.event.fallback,
@@ -532,7 +1040,8 @@ function doRegister(ctx, ws, store, deps = {}) {
         : null,
     };
     deps.mark?.("thinking-self-test", {
-      ok: replaced,
+      ok: accepted,
+      strategy: cfg.strategy,
       provider,
       model,
       charsIn: response.charsIn,
@@ -550,6 +1059,10 @@ function doRegister(ctx, ws, store, deps = {}) {
     disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/status", handler: status }));
     disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/models", handler: models }));
     disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/test", handler: test }));
+    disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/session", handler: session }));
+    disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/presets", handler: presets }));
+    disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/strategy", handler: strategyDetail }));
+    disposers.push(ws.register({ kind: "exact", path: "/iot-thinking/api/preset-dir", handler: presetDir }));
   } catch (error) {
     ctx.logger?.warn?.(`iot-thinking config api route register failed: ${String(error?.message ?? error)}`);
     return false;
@@ -572,8 +1085,8 @@ function doRegister(ctx, ws, store, deps = {}) {
  *
  * @param {object} ctx - plugin context.
  * @param {object} store - ConfigStore.
- * @param {{compress?: Function, mark?: Function, getRoute?: () => ({provider: string|null, model: string|null}|null)}} [deps]
- *   host-side collaborators: the compressor for the self-test route, the ledger
+ * @param {{rewrite?: Function, mark?: Function, getRoute?: () => ({provider: string|null, model: string|null}|null)}} [deps]
+ *   host-side collaborators: the rewriter for the self-test route, the ledger
  *   writer, and the last agent-loop route the self-test can fall back to.
  */
 export function registerConfigApi(ctx, store, deps = {}) {
