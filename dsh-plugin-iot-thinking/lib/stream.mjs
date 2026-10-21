@@ -11,6 +11,23 @@
 // drive it with a fake chunk source and a fake compressor.
 
 /**
+ * The one rule that decides whether a compressed block may replace the original:
+ * the candidate must be a non-empty string and strictly shorter once trimmed.
+ * Exported because the Settings self-test must judge its result by exactly this
+ * rule — a test that only looks for a non-empty reply reports green on a
+ * compression the real link would never substitute.
+ *
+ * @param {unknown} original - the buffered original draft.
+ * @param {unknown} candidate - what the compressor returned.
+ * @returns {boolean} whether the candidate may replace the block.
+ */
+export function isShorterReplacement(original, candidate) {
+  if (typeof candidate !== "string") return false;
+  const next = candidate.trim();
+  return next.length > 0 && next.length < String(original ?? "").trim().length;
+}
+
+/**
  * @param {AsyncIterable<any>} source - chunks from the underlying adapter.
  * @param {object} options - the original GenerateOptions (read-only).
  * @param {object} deps
@@ -74,7 +91,7 @@ export async function* transformStream(source, options, deps) {
     // transformer stays testable with a trivial compressor.
     const candidate = typeof compressed === "string" ? compressed : compressed?.text;
     const candidateEvent = typeof compressed === "string" ? null : compressed?.event ?? null;
-    if (typeof candidate !== "string" || !candidate.trim() || candidate.trim().length >= original.trim().length) {
+    if (!isShorterReplacement(original, candidate)) {
       const shortened = typeof candidate === "string" && candidate.trim();
       if (candidateEvent !== null) emit("thinking-compressed", { ...candidateEvent, replaced: false, reason: shortened ? "not-shorter" : "empty" });
       if (shortened) {

@@ -20,4 +20,7 @@
         # 回本可在设置卡片里调到 700–900 —— 这是调参建议，不是缺陷。
         minChars: 400
         maxTokens: 2000
+        # reasoningEffort 默认 "auto"（先试 off，被宿主拒绝则降级），在
+        # config-store.mjs 的 DEFAULTS 里；要在这里覆盖的话，值必须加引号：
+        # YAML 1.1 会把裸 off 解析成布尔 false。
         archive: true

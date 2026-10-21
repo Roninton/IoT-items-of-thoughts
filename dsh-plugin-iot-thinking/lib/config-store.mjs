@@ -24,6 +24,10 @@ export const DEFAULTS = Object.freeze({
   maxNeutral: 2,
   provider: null,
   model: null,
+  // "auto" = try `off`, then fall back to a cheap advertised level or to no
+  // field at all. A hardcoded "off" made every pi-ai route fail before the
+  // request left the host (issue #3).
+  reasoningEffort: "auto",
   archive: true,
 });
 

@@ -241,6 +241,18 @@ export function sanitizeDraft(text) {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// 退化判定只统计"有实质内容"的行。语法骨架天然重复：一段真在写代码的草稿里
+// ```python 围栏能出现 13~15 次，`return out` / `)` / `}` 更是一屏几十行。
+// 旧判据 duplicate >= 3 把这些也算成循环，于是 23484 字的正常草稿被判退化、整块
+// 换成 53 字兜底——比不压缩更糟（issue #3）。
+const SUBSTANTIVE_CHARS = 20;
+const DUPLICATE_MIN = 5;
+const DUPLICATE_RATIO = 0.25;
+// 同一句长行重复到**过半**才判主导循环：真循环几乎总是整段同一句（占比 ≈1），
+// 而"一段草稿里 8 条 expect(...) 断言相同"是正常写法，不该把整块换成兜底。
+const DOMINANT_REPEAT_MIN = 8;
+const DOMINANT_RATIO = 0.5;
+
 /** 草稿本身是否已经退化成单词/重复行。 */
 export function isDegenerateDraft(text) {
   const lines = String(text ?? "")
@@ -248,10 +260,29 @@ export function isDegenerateDraft(text) {
     .map((line) => line.trim())
     .filter(Boolean);
   if (lines.length === 0) return true;
-  const contents = lines.map((line) => line.replace(LABEL_PREFIX, "").trim());
+  const contents = lines.map((line) => line.replace(LABEL_PREFIX, "").trim()).filter(Boolean);
+  if (contents.length === 0) return true;
   const filler = contents.filter(isFiller).length;
-  const duplicate = contents.length - new Set(contents).size;
-  return (filler >= 3 && filler / contents.length >= 0.4) || duplicate >= 3;
+  if (filler >= 3 && filler / contents.length >= 0.4) return true;
+
+  const substantive = contents.filter((line) => line.length >= SUBSTANTIVE_CHARS);
+  if (substantive.length === 0) return false;
+  const counts = new Map();
+  let repeated = 0;
+  for (const line of substantive) {
+    const seen = (counts.get(line) ?? 0) + 1;
+    counts.set(line, seen);
+    if (seen > repeated) repeated = seen;
+  }
+  const duplicate = substantive.length - counts.size;
+  // 两种真循环：重复行占比够高（正常草稿里的重复是零散的），或同一句长行反复出现
+  // 到成为草稿主体（单词循环由上面的 filler 判据抓）。
+  // 判据刻意保守：误判的代价是**把正常内容换成兜底**，比漏判糟得多；漏判只多一次
+  // 模型调用，输出侧还有质量门兜着。
+  const looped =
+    (duplicate >= DUPLICATE_MIN && duplicate / substantive.length >= DUPLICATE_RATIO) ||
+    (repeated >= DOMINANT_REPEAT_MIN && repeated / substantive.length >= DOMINANT_RATIO);
+  return looped;
 }
 
 /** 压缩结果是否退化（单词节点、重复内容、或压缩器的自我循环评论）。 */
@@ -297,7 +328,7 @@ export function fallbackItems(text) {
     .filter((line) => line.length >= 10 && !isFiller(line) && !META_PATTERN.test(line));
   const picked = lines.slice(0, 1).map((line) => (line.length > 160 ? `${line.slice(0, 160)}…` : line));
   const nodes = picked.map((line) => `[中性] ${line}`);
-  nodes.push("[计划] 上一轮思考出现循环，已省略；继续执行当前任务。");
+  nodes.push("[计划] 上一轮思考已省略；继续执行当前任务。");
   return nodes.join("\n\n");
 }
 

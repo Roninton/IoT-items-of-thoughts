@@ -27,6 +27,21 @@ export const inject = ["llm"];
 export function apply(ctx, config = {}) {
   const store = new ConfigStore(defaultConfigPath(), config);
 
+  // The Settings self-test has no request to follow, so remember the route of the
+  // last real agent-loop request. Writing it costs nothing and only exposes the
+  // provider/model names the Models page already shows.
+  const lastRoute = { provider: null, model: null };
+  const rememberRoute = (options) => {
+    if (!options || typeof options !== "object") return;
+    try {
+      if (!isAgentLoopRequest(options)) return;
+    } catch {
+      return;
+    }
+    lastRoute.provider = typeof options.provider === "string" ? options.provider : null;
+    lastRoute.model = typeof options.model === "string" ? options.model : null;
+  };
+
   const shouldTransform = (options) => {
     if (!options || typeof options !== "object") return false;
     // Auxiliary calls (compaction summary, session title) are hand-built and are
@@ -48,6 +63,7 @@ export function apply(ctx, config = {}) {
     });
 
   ctx.on("llm/stream", (options, next) => {
+    rememberRoute(options);
     let source;
     try {
       source = next();
@@ -66,7 +82,7 @@ export function apply(ctx, config = {}) {
   // The Settings card needs an HTTP bridge. Web profiles mount webServer after
   // this row, so the bridge waits for it. Non-web profiles (headless) can set
   // `webApi: false` in the row config to skip the waiting fiber entirely.
-  if (config.webApi !== false) registerConfigApi(ctx, store);
+  if (config.webApi !== false) registerConfigApi(ctx, store, { compress, mark, getRoute: () => lastRoute });
   mark("constructed", { configPath: store.path });
   ctx.effect(() => () => mark("disposed"));
 }

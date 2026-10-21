@@ -88,6 +88,28 @@ thinking-degenerate { stage: "input" | "output", action: "retry" | "fallback" | 
 原草稿仍在 `originals/`。实测：一段曾经产出 9 条 `[中性]` 单词节点的 622 字草稿，
 现在稳定输出 5 条有效节点（322 字），无需重试；普通 web 会话 1161 字 → 153 字 / 3 条节点。
 
+### 输入门只统计实质行（issue #3）
+
+旧的输入判据是 `duplicate >= 3`，统计**所有**重复行。真在写代码的草稿里
+```python 围栏能出现 13~15 次，`return out` / `)` / `}` 更是一屏几十行，于是一段
+23484 字的正常草稿被判成循环，整块被换成 53 字的兜底内容 —— **比不压缩更糟**。
+
+现在 `isDegenerateDraft()`：
+
+- 只统计长度 ≥ 20 字的**实质行**（围栏、括号、`return out` 这类骨架行不参与）；
+- 重复行 ≥ 5 **且** 占实质行 ≥ 25% 才算循环；
+- 或者同一句长行重复 ≥ 8 次 **且** 占实质行 ≥ 20%（"整句循环"）；
+- 短句/单词循环仍由 filler 判据抓（`filler >= 3` 且占比 ≥ 40%）。
+
+三个真机草稿的验收：修复前 1 个被误判（23484 字 → 53 字兜底），修复后全部不误判；
+真循环与单词循环仍被识别。
+
+**已知取舍**：短行（< 20 字）交错重复的草稿不再在输入侧判退化（例如 A/B 两行反复
+交换），因为"短行重复"与"正常代码骨架"在长度上分不开。代价是这种草稿会多走一次
+模型调用，由输出侧的质量门与确定性兜底接住 —— 误判会把正常内容换成兜底，那比多调
+一次贵得多。同理，"同一句长行重复"要占到实质行的一半才判主导循环：8 条一模一样的
+`expect(...)` 断言是正常写法。
+
 ## Install
 
 装这个插件有 **一个必踩的坑**：仓库根和插件子目录是两个不同的包目录。
@@ -195,7 +217,51 @@ Settings → Plugins → **IoT 思考压缩**:
 - **最多节点数** — hard cap on the node chain (default 8);
 - **最多 [中性] 节点** — extra `[中性]` nodes are merged (default 2; `0` drops them);
 - optional **provider / model** — leave blank to follow the current request's
-  route, or set another provider/model registered in DSH.
+  route, or set another provider/model registered in DSH; the two dropdowns read
+  the host's model catalog (`llm.listProviders()` / `llm.listModels()`) so you
+  cannot pick a model that does not exist. The free-text fields stay as an
+  escape hatch when the catalog is unavailable;
+- **推理档位（`reasoningEffort`）** — `auto` by default: try `off`, and if the
+  route refuses that level, use a cheap level it does advertise or send no field
+  at all. See the section below for why this is the default.
+
+### 压缩器推理档位（`reasoningEffort`）
+
+压缩调用第一次发出时**不再写死 `off`**（issue #3）。旧实现在 `lib/compress.mjs`
+里硬编码 `reasoningEffort: "off"`，而 `off` 恰恰是最不通用的那个值：声明了
+reasoning 的模型会把它从可接受档位里过滤掉，宿主在发请求前就抛
+`UNSUPPORTED_REASONING_EFFORT`（实测 8 ms 返回，供应商根本收不到请求）。于是
+pi-ai 路由上压缩**一次都没成功过**，失败又按设计保留原文，界面上只表现为"效果不明显"。
+
+现在的语义：
+
+| 配置值 | 行为 |
+|---|---|
+| `auto`（默认） | 先发 `off`；被拒则查该路由公开的档位，有 `minimal` / `low` 就用它，没有就不发该字段 |
+| 具体档位 | 原样发送；被拒同样降级为不发该字段（不擅自换档） |
+
+- **不发该字段是宿主唯一不用查目录就接受的取值** —— 它把档位交给适配器自己的默认值。
+  注意这不是"所有路由都能跑"：宿主会解析 `requested ?? defaultEffort`，如果适配器自报的
+  默认档位根本不在它公开的列表里，**连不发字段也会被拒**。那种情况插件会记一条
+  `thinking-effort-unsupported`（`requested: null`）并保留原文——能让它工作的只有修适配器；
+- 降级决策按 `(provider, model, 档位)` **记住**，同一路由后面的块不会再白试一次
+  （进程内缓存；重启 `dsh web` 后重新探测）。**只缓存目录真正答过的结果**：探测超时/
+  报错什么都不决定，下次仍从 `off` 试起，一次目录抖动不会永久拿走 DeepSeek 的快路径；
+- 目录查询有 3 s 上限（`EFFORT_PROBE.timeoutMs`），挂起也不会卡住这一块的响应；
+  查到的档位如果**实际也被拒**（目录乐观/过期），再退一步到不发该字段并记住；
+- 降级会记 `thinking-effort-fallback`（带 `requested` 与被拒原因），
+  `thinking-compressed` 的 payload 多两个字段：`effort`（本次实际发出的档位，
+  `null` = 没发）与 `effortFallback: true`；
+- **代价**：不能发 `off` 的路由上，压缩器自己会思考，每块多 10–20 s（实测
+  1425 字 → 240 字用 11.7 s、4508 字 → 584 字用 22.7 s）。想避免就显式选一个该
+  路由支持的低声档（`minimal` / `low`）；
+- 设置卡里选这一个路由时，会显示宿主 `resolveModelInfo()` 报的**真实可选档位**；
+  拿不到目录元数据时退回通用列表，并提示目录不可用；
+- 档位 id 的词表由适配器定义（宿主侧 `ReasoningEffortId` 对插件是不透明的），
+  所以配置里存的是**卡片给你的那个 id**，不限于常见的 7 个；未知 id 原样发送，
+  被拒就走降级；
+- 直接改 `cordis.patch.yml` 时注意 YAML：`off` / `on` / `no` 这类裸值会被解析成布尔，
+  必须写成 `"off"`（写错只会退回默认，不会崩）。
 
 ### 压缩档位（3 / 5 / 8 标签）
 
@@ -231,12 +297,28 @@ $DSH_HOME/plugin-data/iot-thinking/events.jsonl
 ```
 
 Events: `constructed`, `block-replaced`, `block-kept`, `block-skipped`,
-`block-failed`, `thinking-compressed`, `thinking-failed`, `thinking-degenerate`.
+`block-failed`, `thinking-compressed`, `thinking-failed`, `thinking-skipped`
+(`reason: "aborted"` when *you* cancelled — not a plugin failure),
+`thinking-degenerate`, `thinking-effort-fallback`, `thinking-effort-unsupported`,
+`thinking-effort-probe-failed`, `thinking-self-test`.
 
 `thinking-compressed` 带 `replaced: true|false`：压缩器给出了结果，但只有
 `replaced: true` 的块真的替换了会话里的原文。想按块统计收益，用
 `block-replaced`（每条都真实替换了）或按 `replaced: true` 过滤；直接对
 `thinking-compressed` 求和会把 `not-shorter` 的块算进去，低估真实压缩率。
+
+**失败本来是静默的**：按设计失败就保留原文，界面上只表现为"没效果"。所以
+`thinking-failed` 现在带宿主的 `code`（例如 `UNSUPPORTED_REASONING_EFFORT`、`QUOTA`），
+设置卡也会在**最近一次判定是失败**时直接显示失败原因（一次成功不会把后面连续失败
+的横幅盖掉；确定性兜底替换也算降级）。
+
+设置卡的 **一键测试**（`POST /iot-thinking/api/test`）用同一套 `compressThinking`
+真跑一次（不归档、不改配置），并按与 `stream.mjs` 相同的"必须严格变短才替换"
+规则判定 —— 只检查"有没有返回内容"会假绿：`charsIn == charsOut` 那种结果在真实
+链路上会被 `block-kept (reason=not-shorter)` 拦下。它同样服从 `enabled` 与
+`minChars`：关着、或输入比阈值短时直接告诉你"真实链路会跳过"，不报绿。压缩器
+失败（含你按 Esc 取消）会报 `compressor-failed` 并带最后一行的失败原因，不会伪装
+成"没有变短"。测试会记一条 `thinking-self-test`，自带样稿超过默认 `minChars`。
 
 Original drafts are archived before replacement:
 
@@ -251,27 +333,41 @@ original draft exists only in this archive.
 
 | File | Role |
 |---|---|
-| `index.mjs` | host plugin: `llm/stream` hook + config API |
-| `lib/stream.mjs` | pure chunk transformer (hold → compress → single delta + block-end) |
-| `lib/compress.mjs` | auxiliary `ctx.llm.stream()` call(s), low-temperature retry, quality gate, deterministic fallback |
+| `index.mjs` | host plugin: `llm/stream` hook + config API + last agent-loop route |
+| `lib/stream.mjs` | pure chunk transformer (hold → compress → single delta + block-end) + the one replacement rule |
+| `lib/compress.mjs` | auxiliary `ctx.llm.stream()` call(s), effort recovery, low-temperature retry, quality gate, deterministic fallback |
+| `lib/effort.mjs` | `reasoningEffort` policy: ids, per-route decision cache, refusal detection |
 | `lib/think.mjs` | IoT instruction, prompt wrapper, draft sanitization, degeneration detection, output cleanup |
 | `lib/config-store.mjs` | live JSON config (row defaults + user file) |
-| `lib/config-api.mjs` | exact HTTP routes for the Settings card |
+| `lib/config-api.mjs` | exact HTTP routes for the Settings card (`config` / `status` / `models` / `test`) |
 | `lib/ledger.mjs` | events ledger + original-draft archive |
 | `lib/client.js` | Settings → Plugins → IoT 思考压缩 card |
 | `selftest.mjs` | pure transformer tests (no dsh boot, no model) |
+| `smoke.mjs` | host-side wiring test: real `index.mjs` + real dsh-llm seam, fake ctx/model call |
 
 ## Self-test
 
 ```powershell
 cd D:\_playground\workspace\IoT-items-of-thoughts\dsh-plugin-iot-thinking
-node selftest.mjs
+node selftest.mjs   # 纯逻辑，不启动 dsh、不连模型
+node smoke.mjs      # 接线：真插件入口 + 真 dsh-llm seam，假的 ctx 与模型调用
 ```
 
 Covers: replacement of a completed block, disabled pass-through, non-agent-loop
 pass-through, `minChars`, compressor failure, empty/longer output fallback,
 multiple blocks, aborted streams, block-end without deltas, output cleanup,
-degenerate input/output detection, strict retry, and deterministic fallback.
+degenerate input/output detection, strict retry, deterministic fallback,
+effort normalization and the auto/fallback/cached route decisions, the
+degenerate-input fixture from issue #3 (code fences and short lines are not
+loops), the strict-shorter replacement rule, ledger redaction including the
+failure message, and the three HTTP routes the card talks to.
+
+`smoke.mjs` 多盖一层：插件入口能加载（seam 解析成功）、`llm/stream` 钩子真的被注册、
+一个 reasoning 块被原地替换而正文不动、压缩调用第一次带 `off`、被拒后第二次带该路由
+的 `low`、账本里 `thinking-effort-fallback` 与 `replaced: true` 都在、设置卡的一键测试
+复用同一批路由决策且 `charsIn == charsOut` 不报绿、四个 HTTP 路由都挂着门禁、客户端
+半个能在最小 `__ModuleLoader__` + React 替身下加载并渲染。它需要盘上有一个 dsh 安装来
+解析 seam；找不到时设 `IOT_DSH_SEAM_ANCHORS`。
 
 ## Known limits
 
@@ -279,7 +375,9 @@ degenerate input/output detection, strict retry, and deterministic fallback.
    the draft is buffered, then the compact text appears. Streaming the compact
    text while compressing is deliberately out of scope ("压缩后返回").
 2. **Extra model call per compressed block.** The compressor uses the current
-   route by default; set a cheaper provider/model in the card if needed.
+   route by default; set a cheaper provider/model in the card if needed. On a
+   route that refuses `off` the compressor also thinks while compressing, which
+   costs 10–20 s more per block (see 推理档位 above).
 3. **Not a security boundary.** The plugin runs with the host's permissions and
    can read model output; install only from a source you trust.
 4. **The original draft is not in the session log.** It is archived under
@@ -292,13 +390,16 @@ degenerate input/output detection, strict retry, and deterministic fallback.
    `replaced: true|false`：只有 `true` 的块真的替换了原文。变长的块会被
    `block-kept (reason=not-shorter)` 拦下、原文照旧保留，所以拿 `thinking-compressed`
    求和仍会低估真实收益（`replaced: true` 过滤则正确）。
-8. **设置接口的门禁与 LAN 绑定。** `/iot-thinking/api/config` 与
-   `/status` 挂在宿主 `webServer` 上，而宿主只维护路由表、不做鉴权 —— 所以这两个
-   handler 自己守：要求自定义头 `x-iot-thinking: 1`（跨站页面设不了它而不触发预检，
-   本服务从不回 CORS 批准）、`Sec-Fetch-Site` 只收 `same-origin`/`none`、`Origin`
-   的 host 必须等于 `Host`、拒绝 opaque origin（DNS rebinding）、默认**只接受
+8. **设置接口的门禁与 LAN 绑定。** `/iot-thinking/api/config`、`/status`、
+   `/models` 与 `/test` 挂在宿主 `webServer` 上，而宿主只维护路由表、不做鉴权 ——
+   所以这些 handler 自己守：要求自定义头 `x-iot-thinking: 1`（跨站页面设不了它而不
+   触发预检，本服务从不回 CORS 批准）、`Sec-Fetch-Site` 只收 `same-origin`/`none`、
+   `Origin` 的 host 必须等于 `Host`、拒绝 opaque origin（DNS rebinding）、默认**只接受
    loopback 对端**。GET 不再下发配置文件的绝对路径，账本事件只保留卡片要用的字段
-   （不再有 `sessionId` / `archived` / `provider` / `model`）。
+   （不再有 `sessionId` / `archived` / `provider` / `model`；`message` 只留单行截断后的
+   240 字失败原因）。`/models` 只回宿主已有的 provider / model / 档位元数据（Models
+   页本来就显示这些），`/test` 只接受一段草稿文本，路由取自配置或最近一次 agent-loop
+   请求，不能由请求体指定。
    **代价**：若你把 web 绑定到 `0.0.0.0`（如 `dsh-lan-access`），设置卡片默认会被
    403 拒绝；要恢复就在宿主环境里设 `IOT_THINKING_ALLOW_REMOTE=1`，并把「谁能访问
    这个端口」当成安全边界来管理。
@@ -311,3 +412,7 @@ degenerate input/output detection, strict retry, and deterministic fallback.
    版本化安装（`$DSH_HOME/dsh-<ver>/`）和源码 checkout。
 10. **装完先看账本，别信"装上了"。** 只有 `$DSH_HOME/plugin-data/iot-thinking/events.jsonl`
     里出现 `constructed`，才说明这条 entry 真的激活了；否则就是第 9 条那种静默失效。
+11. **一键测试是真调用。** 它跑一次完整压缩（按一次请求计费、约 10–30 s），不做归档、
+    不改配置；失败时同样按"保留原文"处理。它证明的是"当前设置下这条路能压出更短的节点"，
+    不是"N 轮会话里质量一定不降"。路由留空时它用**最近一次 agent-loop 请求**的
+    provider/model；一个请求都还没发过时会直接报错（没有可用的路由）。

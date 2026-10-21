@@ -35,6 +35,9 @@ dsh plugin --profile web add "<repo>\dsh-plugin-iot-thinking"
 # 2) 插件自测（纯逻辑，不启动 dsh、不连模型）
 node dsh-plugin-iot-thinking/selftest.mjs
 
+# 2b) 接线自测（真插件入口 + 真 dsh-llm seam，假的 ctx 与模型调用；需要盘上有 dsh 安装）
+node dsh-plugin-iot-thinking/smoke.mjs
+
 # 3) pciso 平台测试（可选，跑的是实验台那套）
 $env:PYTHONPATH = "$PWD\src"
 python -m pytest -q -m "not slow"
@@ -43,9 +46,17 @@ python -m pytest -q -m "not slow"
 开关与参数在 **Settings → Plugins → IoT 思考压缩**：启用/关闭、最小压缩字数（默认 400；
 实测 400–500 区间收益很薄，想回本可调到 700–900，见插件 README）、
 最大输入字数（默认 24000）、节点输出上限（`maxTokens`，默认 2000）、最多节点数（默认 8）、
-最多 `[中性]` 数（默认 2）、可选 provider/model，以及**压缩档位**（`compact` 3 标签 /
+最多 `[中性]` 数（默认 2）、可选 provider/model（可从宿主模型目录下拉选）、
+**压缩器推理档位**（`reasoningEffort`，默认 `auto`）以及**压缩档位**（`compact` 3 标签 /
 `balanced` 5 标签 / `full` 8 标签）。配置写到 `$DSH_HOME/plugin-data/iot-thinking/config.json`，
 每次请求按 mtime 读，**改完下一个模型请求就生效，不用重启**。
+
+`auto` 档位的意思是：先发 `off`（压缩器不花预算在自己的 thinking 上），宿主拒绝该档位时
+改用该路由公开的 `minimal`/`low`，没有就不发这个字段、由适配器取默认值。旧实现把 `off`
+写死，于是不接受该档位的路由（pi-ai 一类）**压缩一次都没成功过**，而失败按设计静默保留
+原文 —— 界面上只表现为"没效果"。运行中可点卡片上的**一键测试**：它用同一套压缩器真跑
+一次，并按与真实链路相同的"必须变短才替换"规则判定（只检查"有没有返回内容"会假绿）；
+关着插件、或输入比 `minChars` 短时它会直接说"真实链路会跳过"，不报绿。
 
 ## 怎么验证它真的生效了
 
@@ -57,8 +68,13 @@ $DSH_HOME/plugin-data/iot-thinking/originals/<sid>/<time>-block<index>.txt   # �
 ```
 
 事件：`constructed` / `block-replaced` / `block-kept` / `block-skipped` / `block-failed` /
-`thinking-compressed` / `thinking-failed` / `thinking-degenerate`。
-`thinking-compressed` 带 `charsIn / charsOut / profile`，可以按档位统计压缩比。
+`thinking-compressed` / `thinking-failed` / `thinking-skipped` / `thinking-degenerate` /
+`thinking-effort-fallback` / `thinking-effort-unsupported` / `thinking-effort-probe-failed` /
+`thinking-self-test`。
+`thinking-compressed` 带 `charsIn / charsOut / profile`（以及本次实际发出的 `effort`），
+可以按档位统计压缩比；`thinking-failed` 带宿主的 `code`（如 `UNSUPPORTED_REASONING_EFFORT`），
+设置卡在最近一次判定是失败时直接显示原因；`thinking-skipped` 的 `reason: "aborted"`
+表示是你自己按了 Esc，不是插件出错。
 替换前的原文只存在 `originals/` 里 —— dsh 存的是 waterfall 吐出来的那些 chunk，块一被换，
 原文在会话里就没了。
 
@@ -155,6 +171,10 @@ experiment/  out/  state/  留档与运行期产物，不进版本库（见 .git
 - **thinking 是流式中断的**：块结束才替换，所以客户端看到的是"顿一下再出现"，不是逐字流。
   "边压边回"是明确排除的次要功能。
 - **每压一块多一次模型调用**（退化时多一次严格重试）。默认走当前请求的路由，可在设置里换更便宜的。
+- **不支持 `off` 档位的路线上，压缩器会自己思考**：插件降级为不发 `reasoningEffort`
+  （宿主不用查目录就接受这个取值，但适配器自报的默认档位本身不合法时连它也会被拒），
+  代价是每块多 10–20 s。想避免就显式选该路由公开的低声档（`minimal` / `low`），
+  或在设置里换一个支持 `off` 的压缩器路由。
 - **不是安全边界**：插件以 host 权限运行、能读模型输出，只装可信来源。
 - **压缩质量有已知失效面**：标签记账错位（该 `[决定]` 的落进 `[待定]`）、块内退化重复。
   后者已由四道闸（输入净化 / 提示词 / 低温度 + 严格重试 / 质量门 + 确定性兜底）拦住，

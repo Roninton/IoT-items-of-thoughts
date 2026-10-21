@@ -7,6 +7,15 @@
 // through untouched: no recursion, no compressing the compressor.
 
 import {
+  AUTO_EFFORT,
+  isUnsupportedEffortFailure,
+  knownEffortPlan,
+  normalizeEffort,
+  pickLowEffort,
+  planKey,
+  rememberEffortPlan,
+} from "./effort.mjs";
+import {
   buildCompressionPrompt,
   fallbackItems,
   formatNodes,
@@ -29,6 +38,31 @@ import {
  */
 function compressed(text, payload) {
   return { text, event: payload };
+}
+
+/**
+ * A route's catalog lookup is advisory, so it must never be able to stall a
+ * response: the reasoning block already ended and the reader is waiting. Tests
+ * lower this to keep the timeout path fast.
+ */
+export const EFFORT_PROBE = { timeoutMs: 3000 };
+
+/** Reject after `timeoutMs` without leaving the timer holding the process open. */
+function withTimeout(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+    timer.unref?.();
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -63,15 +97,29 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
   const archived = cfg.archive === false ? null : archive({ sessionId: options.sessionId, index, text, provider, model });
   const maxTokens = Number.isFinite(cfg.maxTokens) ? Math.max(1, cfg.maxTokens) : 2000;
 
-  const run = async (instruction, temperature) => {
+  // Which reasoning level to ask for. "auto" is the only value that works on
+  // every route without configuration: it starts from `off` and learns from the
+  // route's own refusal (issue #3).
+  const mode = normalizeEffort(cfg.reasoningEffort) ?? AUTO_EFFORT;
+  const key = planKey(provider, model, mode);
+  /** Effort id carried by the last attempt; null = the field was omitted. */
+  let effortSent = null;
+  let effortFallback = false;
+  let called = false;
+
+  const run = async (instruction, temperature, effort) => {
     const assembler = new Llm.BlockAssembler();
+    effortSent = effort;
+    called = true;
     try {
       const stream = ctx.llm.stream({
         provider,
         model,
-        // The compressor must not spend the output budget on its own thinking.
-        // DeepSeek maps "off" to thinking:{type:"disabled"}.
-        reasoningEffort: "off",
+        // Omitting the field hands the level choice to the adapter's own default,
+        // which is what a route that refuses `off` needs. `off` stays the fast
+        // path: it stops the compressor from spending the output budget on its
+        // own thinking (DeepSeek maps it to thinking:{type:"disabled"}).
+        ...(effort === null ? {} : { reasoningEffort: effort }),
         // Low temperature makes the flash compressor much less likely to fall
         // into a one-word repetition loop.
         temperature,
@@ -90,11 +138,26 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
       });
       for await (const chunk of stream) assembler.push(chunk);
     } catch (error) {
-      return { error: String(error?.message ?? error), finish: assembler.finish };
+      return {
+        error: String(error?.message ?? error),
+        code: typeof error?.code === "string" ? error.code : undefined,
+        finish: assembler.finish,
+      };
     }
     const finish = assembler.finish;
     if (finish && finish.kind === "error") {
-      return { error: finish.failure?.message ?? "unknown", finish };
+      return { error: finish.failure?.message ?? "unknown", code: finish.failure?.code, finish };
+    }
+    // An aborted call is NOT success. dsh normalizes it to `finish.kind:"aborted"`
+    // with no output; treating that as an empty (hence degenerate) answer would
+    // replace a perfectly good thinking block with the deterministic stub just
+    // because the user pressed Esc or the turn timed out.
+    if (finish && finish.kind === "aborted") {
+      return {
+        error: finish.failure?.message ?? "compressor call aborted",
+        code: finish.failure?.code ?? "ABORTED",
+        finish,
+      };
     }
     const output = assembler
       .blocks()
@@ -103,6 +166,117 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
       .join("\n");
     return { output, finish };
   };
+
+  /**
+   * Ask the exact route which effort levels it advertises, so the compressor can
+   * keep thinking off (or nearly off) on routes that simply do not accept `off`.
+   * Purely advisory: an unavailable or slow catalog never fails the block, and a
+   * failed probe is reported as *unknown* rather than as "this route has no low
+   * level" — caching the latter would cost a native DeepSeek route its `off` fast
+   * path for the rest of the process after one catalog hiccup.
+   *
+   * @returns {Promise<{ answered: boolean, effort: string|null }>}
+   */
+  const probeLowEffort = async () => {
+    const llm = (typeof ctx.get === "function" ? ctx.get("llm") : undefined) ?? ctx?.llm;
+    if (typeof llm?.resolveModelInfo !== "function") return { answered: false, effort: null };
+    try {
+      const info = await withTimeout(llm.resolveModelInfo(provider, model, options.signal), EFFORT_PROBE.timeoutMs, "resolveModelInfo");
+      return { answered: true, effort: pickLowEffort((info?.reasoning?.efforts ?? []).map((effort) => effort?.id)) };
+    } catch (error) {
+      mark("thinking-effort-probe-failed", {
+        index,
+        provider,
+        model,
+        message: String(error?.message ?? error),
+      });
+      return { answered: false, effort: null };
+    }
+  };
+
+  /**
+   * One compressor attempt, including the effort-level recovery. The recovery is
+   * not a retry of a failed compression: the request never reached the provider,
+   * so it costs one local round-trip, and an answered route decision is cached.
+   */
+  const attempt = async (instruction, temperature, stage) => {
+    const known = knownEffortPlan(key);
+    const send = known !== undefined ? known : mode === AUTO_EFFORT ? "off" : mode;
+    let result = await run(instruction, temperature, send);
+    if (!result.error || !isUnsupportedEffortFailure(result)) return result;
+
+    // `null` means "send no effort at all". If even that is refused, the adapter's
+    // own default level is missing from its advertised list: nothing this plugin
+    // can send will work, so name that cause instead of retrying.
+    if (send === null) {
+      mark("thinking-effort-unsupported", {
+        index,
+        provider,
+        model,
+        stage,
+        requested: null,
+        reason: "adapter-default-unsupported",
+        message: result.error,
+      });
+      return result;
+    }
+
+    mark("thinking-effort-fallback", {
+      index,
+      provider,
+      model,
+      stage,
+      requested: send,
+      reason: "unsupported",
+      message: result.error,
+    });
+    // Only auto mode goes looking for a cheap supported level. An explicit
+    // choice that the route refuses is a configuration signal, not a hint to
+    // pick some other level: send nothing and let the provider decide.
+    const probe = mode === AUTO_EFFORT && send === "off" ? await probeLowEffort() : { answered: true, effort: null };
+    let chosen = probe.effort;
+    result = await run(instruction, temperature, chosen);
+    effortFallback = true;
+    // An adapter can advertise a level the host then refuses anyway (stale or
+    // optimistic catalog). Omitting the field is the remaining option, so try it
+    // once instead of leaving the route pinned on a level that fails every block.
+    if (probe.answered && chosen !== null && isUnsupportedEffortFailure(result)) {
+      chosen = null;
+      result = await run(instruction, temperature, chosen);
+    }
+    // "No field at all" refused is the adapter's own default being unadvertised —
+    // nothing this plugin can send will work. Name it, and do not cache it: the
+    // adapter can be fixed, and a cache entry would pin the route for the process.
+    if (chosen === null && isUnsupportedEffortFailure(result)) {
+      mark("thinking-effort-unsupported", {
+        index,
+        provider,
+        model,
+        stage,
+        requested: null,
+        reason: "adapter-default-unsupported",
+        message: result.error,
+      });
+      return result;
+    }
+    if (probe.answered) rememberEffortPlan(key, chosen);
+    return result;
+  };
+
+  const payload = (extra) => ({
+    index,
+    provider,
+    model,
+    profile,
+    // `effort: null` is meaningful only after a call went out (the field was
+    // omitted); a degenerate input that never called the model has no effort.
+    ...(called ? { effort: effortSent } : {}),
+    ...(effortFallback ? { effortFallback: true } : {}),
+    charsIn: text.length,
+    ms: Date.now() - started,
+    archived,
+    ...extra,
+  });
 
   const fallback = () => {
     const items = fallbackItems(text);
@@ -115,33 +289,30 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     const items = fallback();
     if (items) {
       mark("thinking-degenerate", { index, stage: "input", chars: text.length, charsOut: items.length, action: "fallback" });
-      return compressed(items, {
-        index,
-        provider,
-        model,
-        profile,
-        charsIn: text.length,
-        charsOut: items.length,
-        ms: Date.now() - started,
-        archived,
-        finish: "degenerate-input",
-        truncated: false,
-        retried: false,
-        fallback: true,
-      });
+      return compressed(
+        items,
+        payload({ charsOut: items.length, finish: "degenerate-input", truncated: false, retried: false, fallback: true }),
+      );
     }
     mark("thinking-degenerate", { index, stage: "input", chars: text.length, action: "skip" });
     return null;
   }
 
-  const first = await run(buildCompressionPrompt(text, { profile }), 0.2);
+  const first = await attempt(buildCompressionPrompt(text, { profile }), 0.2, "first");
   if (first.error) {
+    // 用户按 Esc / 请求超时不是插件的失败：记 skipped 而不是 failed，免得设置卡
+    // 因为一次主动取消就弹"压缩一直失败"。
+    if (first.code === "ABORTED") {
+      mark("thinking-skipped", { index, reason: "aborted", stage: "first", chars: text.length });
+      return null;
+    }
     mark("thinking-failed", {
       index,
       provider,
       model,
       ms: Date.now() - started,
       message: first.error,
+      code: first.code,
       stage: "first",
     });
     return null;
@@ -162,23 +333,28 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
       finish: first.finish?.kind,
     });
     retried = true;
-    const second = await run(buildCompressionPrompt(text, { profile, strict: true }), 0.1);
-    let secondRawDegenerate = false;
+    const second = await attempt(buildCompressionPrompt(text, { profile, strict: true }), 0.1, "retry");
     if (second.error) {
+      if (second.code === "ABORTED") {
+        mark("thinking-skipped", { index, reason: "aborted", stage: "retry", chars: text.length });
+        return null;
+      }
       mark("thinking-failed", {
         index,
         provider,
         model,
         ms: Date.now() - started,
         message: second.error,
+        code: second.code,
         stage: "retry",
       });
-      items = "";
-    } else {
-      secondRawDegenerate = isDegenerateItems(second.output);
-      items = formatNodes(second.output, { profile, maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
-      lastFinish = second.finish;
+      // 失败就回原文：压缩器没给出结果（报错/中止）时拿兜底节点替换正文，
+      // 等于把"没压成"降级成"内容被砍成两句"——那比不压糟。
+      return null;
     }
+    const secondRawDegenerate = isDegenerateItems(second.output);
+    items = formatNodes(second.output, { profile, maxNodes: cfg.maxNodes, maxNeutral: cfg.maxNeutral });
+    lastFinish = second.finish;
 
     if (secondRawDegenerate || !items || isDegenerateItems(items)) {
       const itemsFallback = fallback();
@@ -191,20 +367,16 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
           action: "fallback",
           retried,
         });
-        return compressed(itemsFallback, {
-          index,
-          provider,
-          model,
-          profile,
-          charsIn: text.length,
-          charsOut: itemsFallback.length,
-          ms: Date.now() - started,
-          archived,
-          finish: lastFinish?.kind,
-          truncated: false,
-          retried,
-          fallback: true,
-        });
+        return compressed(
+          itemsFallback,
+          payload({
+            charsOut: itemsFallback.length,
+            finish: lastFinish?.kind,
+            truncated: lastFinish?.kind === "max-tokens",
+            retried,
+            fallback: true,
+          }),
+        );
       }
       mark("thinking-degenerate", { index, stage: "output", charsIn: text.length, action: "skip", retried });
       return null;
@@ -216,17 +388,13 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ar
     return null;
   }
 
-  return compressed(items, {
-    index,
-    provider,
-    model,
-    profile,
-    charsIn: text.length,
-    charsOut: items.length,
-    ms: Date.now() - started,
-    archived,
-    finish: lastFinish?.kind,
-    truncated: lastFinish?.kind === "max-tokens",
-    retried,
-  });
+  return compressed(
+    items,
+    payload({
+      charsOut: items.length,
+      finish: lastFinish?.kind,
+      truncated: lastFinish?.kind === "max-tokens",
+      retried,
+    }),
+  );
 }
