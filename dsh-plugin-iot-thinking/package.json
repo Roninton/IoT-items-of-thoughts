@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-iot-thinking",
-  "version": "0.2.0",
-  "description": "IoT (Items of Thoughts) for DeepSeek Harness: rewrite the reasoning block inside llm/stream before the assistant message is committed. The rewrite is chosen per session / per agent preset from a strategy registry (decision nodes, long-range research, in-character voice), with no compaction checkpoint.",
+  "version": "0.3.0",
+  "description": "IoT (Items of Thoughts) for DeepSeek Harness: rewrite the reasoning block inside llm/stream before the assistant message is committed — decision-node compression per session / agent preset, offloadable to a cheaper route, plus an optional outside-observer advice layer ([旁观者建议]) that can run builtin or as a concurrent external model. No compaction checkpoint.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
@@ -12,6 +12,7 @@
   "files": [
     "index.mjs",
     "lib/",
+    "skills/",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -42,5 +43,13 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "test": "node selftest.mjs && node --test session-archive-test.mjs && node archive-runtime-test.mjs && node session-memory-test.mjs && node --experimental-vm-modules teacher-entry-test.mjs && node teacher-context-test.mjs && node smoke.mjs",
+    "test:archive": "node --test session-archive-test.mjs && node archive-runtime-test.mjs && node session-memory-test.mjs",
+    "test:session-host": "node session-host-test.mjs",
+    "test:host-context": "node host-context-test.mjs --expect-context",
+    "test:teacher": "node --experimental-vm-modules teacher-entry-test.mjs",
+    "smoke": "node smoke.mjs"
+  }
 }

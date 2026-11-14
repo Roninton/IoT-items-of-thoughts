@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-iot-thinking",
-  "version": "0.2.0",
-  "description": "IoT (Items of Thoughts) for DeepSeek Harness: rewrite the reasoning block inside llm/stream before the assistant message is committed. The rewrite is chosen per session / per agent preset from a strategy registry (decision nodes, long-range research, in-character voice), with no compaction checkpoint.",
+  "version": "0.3.0",
+  "description": "IoT (Items of Thoughts) for DeepSeek Harness: rewrite reasoning blocks before assistant commit, with per-session/preset compression, optional advisor and teacher consultation, plus durable session archive and memory tools. No compaction checkpoint.",
   "type": "module",
   "main": "dsh-plugin-iot-thinking/index.mjs",
   "exports": {
@@ -24,6 +24,7 @@
   "files": [
     "dsh-plugin-iot-thinking/index.mjs",
     "dsh-plugin-iot-thinking/lib/",
+    "dsh-plugin-iot-thinking/skills/",
     "dsh-plugin-iot-thinking/cordis.patch.yml",
     "dsh-plugin-iot-thinking/package.json",
     "dsh-plugin-iot-thinking/README.md"
@@ -38,5 +39,12 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/Roninton/IoT-items-of-thoughts.git"
+  },
+  "scripts": {
+    "test": "npm --prefix dsh-plugin-iot-thinking test",
+    "test:archive": "npm --prefix dsh-plugin-iot-thinking run test:archive",
+    "test:teacher": "npm --prefix dsh-plugin-iot-thinking run test:teacher",
+    "smoke": "npm --prefix dsh-plugin-iot-thinking run smoke",
+    "check:manifests": "node scripts/check-manifests.mjs"
   }
 }

@@ -10,8 +10,11 @@
 import { normalizeEffort } from "./effort.mjs";
 import { tailEvents } from "./ledger.mjs";
 import { strategyById, strategyIds } from "./strategies.mjs";
-import { normalizeRouteEntry, resolveConfig, strategyCatalog } from "./route.mjs";
+import { normalizeRouteEntry, resolveConfig, resolveRewriteRoute, strategyCatalog } from "./route.mjs";
 import { listPresets, readPreset, writePreset } from "./custom.mjs";
+import { builtinPresetCatalog, builtinPresetById } from "./builtin-presets.mjs";
+import { DEFAULTS } from "./config-store.mjs";
+import { appendAdvice } from "./advisor.mjs";
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -189,8 +192,12 @@ function strategyValue(value) {
   if (value === null || value === "") return null;
   const entry = normalizeRouteEntry(value);
   if (!entry) return undefined;
-  if (entry.id === "custom") return entry.custom ? `custom:${entry.custom}` : "custom";
-  return entry.id;
+  if (entry.id !== "custom") return entry.id;
+  // 会话级覆盖允许带 prompt：`{ strategy: "custom", preset: "builtin:standard" }`。
+  // 落盘形态保持对象，读的时候两种形态都认。
+  if (entry.builtin) return { strategy: "custom", preset: `builtin:${entry.builtin}` };
+  if (entry.custom) return `custom:${entry.custom}`;
+  return "custom";
 }
 
 /**
@@ -207,20 +214,83 @@ function strategyValue(value) {
  * @param {object|null} patch - 请求体里的映射表。
  * @returns {object} 校验后的完整表。
  */
+/** 会话级教师开关的归一化：只收 enabled，其余参数跟全局走。 */
+function sessionTeacherValue(value) {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (typeof value.enabled !== "boolean") return undefined;
+  return { enabled: value.enabled };
+}
+
+/** 会话级指导覆盖的归一化：与 ConfigStore 里的同名逻辑保持一致。 */
+function sessionGuidanceValue(value) {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out = {};
+  if (typeof value.enabled === "boolean") out.enabled = value.enabled;
+  if (value.mode === "builtin" || value.mode === "external") out.mode = value.mode;
+  return Object.keys(out).length ? out : undefined;
+}
+
 function strategyTable(patch) {
   const out = {};
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) return out;
   for (const [key, value] of Object.entries(patch)) {
     if (typeof key !== "string" || !key) continue;
     const entry = normalizeRouteEntry(value);
-    if (!entry) continue;
-    // 自定义预设要保住名字（那是 presetDir 里的文件名）：存成 `custom:名字`。
-    if (entry.id === "custom") {
-      out[key] = entry.custom ? `custom:${entry.custom}` : "custom";
+    // 会话级指导覆盖必须原样穿过这张表：否则设置卡一保存，所有会话的建议设置
+    // 都被抹掉（这是"双轨"里最难发现的一条 —— 界面上看着还在，重读就没了）。
+    const guidance = value && typeof value === "object" && !Array.isArray(value) && "guidance" in value
+      ? sessionGuidanceValue(value.guidance)
+      : undefined;
+    const teacher = value && typeof value === "object" && !Array.isArray(value) && "teacher" in value
+      ? sessionTeacherValue(value.teacher)
+      : undefined;
+    if (!entry) {
+      const extra = {};
+      if (guidance !== undefined) extra.guidance = guidance;
+      if (teacher !== undefined) extra.teacher = teacher;
+      if (Object.keys(extra).length) out[key] = extra;
       continue;
     }
-    out[key] = entry.id;
+    const withGuidance = (base) => {
+      let result = guidance === undefined
+        ? base
+        : { ...(typeof base === "object" ? base : { strategy: base }), guidance };
+      if (teacher !== undefined) {
+        result = { ...(typeof result === "object" ? result : { strategy: result }), teacher };
+      }
+      return result;
+    };
+    // 自定义预设要保住名字（那是 presetDir 里的文件名）：存成 `custom:名字`。
+    if (entry.id === "custom") {
+      if (entry.builtin) {
+        out[key] = withGuidance({ strategy: "custom", preset: `builtin:${entry.builtin}` });
+        continue;
+      }
+      out[key] = withGuidance(entry.custom ? `custom:${entry.custom}` : "custom");
+      continue;
+    }
+    out[key] = withGuidance(entry.id);
   }
+  return out;
+}
+
+/**
+ * 改写器路由块的写入：provider/model 只收非空字符串或 null（null = 跟随会话），
+ * effort 走 normalizeEffort（未知值不落盘），fallback 只认 keep/session。
+ * 返回的是**增量**对象：store 的 merge 会把它叠在现有 rewrite 上。
+ */
+function sanitizeRewrite(payload) {
+  const out = {};
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return out;
+  for (const key of ["provider", "model"]) {
+    if (payload[key] === null) out[key] = null;
+    else if (typeof payload[key] === "string") out[key] = payload[key].trim() || null;
+  }
+  const effort = normalizeEffort(payload.effort);
+  if (effort !== null) out.effort = effort;
+  if (payload.fallback === "keep" || payload.fallback === "session") out.fallback = payload.fallback;
   return out;
 }
 
@@ -237,20 +307,119 @@ function sanitize(payload) {
   if (payload.agentPresets !== undefined) next.agentPresets = strategyTable(payload.agentPresets);
   if (payload.sessions !== undefined) next.sessions = strategyTable(payload.sessions);
   if (payload.strategies !== undefined) next.strategies = payload.strategies;
-  if (Number.isFinite(payload.maxChars)) next.maxChars = Math.max(1, Math.floor(payload.maxChars));
+  // 数字字段：`null` = 清空并恢复默认（卡片把输入框清空时发的就是 null）。
+  // 之前这里只认有限数字，null 被跳过，旧值会一直留在盘上。
+  if (payload.maxChars === null) next.maxChars = DEFAULTS.maxChars;
+  else if (Number.isFinite(payload.maxChars)) next.maxChars = Math.max(1, Math.floor(payload.maxChars));
+  if (payload.rewriteTimeoutMs === null) next.rewriteTimeoutMs = DEFAULTS.rewriteTimeoutMs;
+  else if (Number.isFinite(payload.rewriteTimeoutMs)) next.rewriteTimeoutMs = Math.max(1000, Math.floor(payload.rewriteTimeoutMs));
+  if (payload.rewriteBudget === null) next.rewriteBudget = DEFAULTS.rewriteBudget;
+  else if (Number.isFinite(payload.rewriteBudget)) next.rewriteBudget = Math.max(1, Math.floor(payload.rewriteBudget));
   if (typeof payload.archive === "boolean") next.archive = payload.archive;
+  if (typeof payload.sessionLog === "boolean") next.sessionLog = payload.sessionLog;
+  if (typeof payload.sessionMemory === "boolean") next.sessionMemory = payload.sessionMemory;
   if (typeof payload.sessionSwitch === "boolean") next.sessionSwitch = payload.sessionSwitch;
   // 自定义预设三件：目录、贴入的文本、替换规则。
   if (typeof payload.presetDir === "string") next.presetDir = payload.presetDir.trim();
   if (typeof payload.customText === "string") next.customText = payload.customText;
+  // 用户注入：空串 = 不注入；`builtin:<id>` / `custom:<文件名>` / `inline:<文本>` / 裸文本。
+  if (typeof payload.inject === "string") next.inject = payload.inject;
   if (payload.presetAccept === "shorter" || payload.presetAccept === "different") next.presetAccept = payload.presetAccept;
-  // 未知档位不落盘；null 表示 auto。
-
-  const effort = normalizeEffort(payload.reasoningEffort);
-  if (effort !== null) next.reasoningEffort = effort;
-  for (const key of ["provider", "model"]) {
-    if (payload[key] === null) next[key] = null;
-    else if (typeof payload[key] === "string") next[key] = payload[key].trim() || null;
+  // 内置预设的用户覆盖：`{ "<id>": "正文" }`；空串 = 恢复默认（删键）。
+  if (payload.builtinOverrides !== undefined) {
+    const out = {};
+    const source = payload.builtinOverrides && typeof payload.builtinOverrides === "object" && !Array.isArray(payload.builtinOverrides)
+      ? payload.builtinOverrides
+      : {};
+    for (const [id, text] of Object.entries(source)) {
+      if (!builtinPresetById(id)) continue;
+      if (typeof text !== "string" || !text.trim()) continue;
+      out[id] = text.slice(0, 64 * 1024);
+    }
+    next.builtinOverrides = out;
+  }
+  // 输出预算与"不许在输出里思考"：只对 custom 档位生效。
+  if (Number.isFinite(payload.maxOut)) next.maxOut = Math.max(0, Math.floor(payload.maxOut));
+  if (typeof payload.noThink === "boolean") next.noThink = payload.noThink;
+  // 全局默认的"自定义预设"：`builtin:<id>` / `custom:<文件名>` / `custom`（贴入文本）。
+  // 只收这三种形态，其它一律丢弃（写进去也不会被 resolveConfig 用上）。
+  if (payload.defaultPreset === null) {
+    next.defaultPreset = null;
+  } else if (typeof payload.defaultPreset === "string") {
+    const raw = payload.defaultPreset.trim();
+    const entry = raw ? normalizeRouteEntry(raw) : null;
+    if (!raw) next.defaultPreset = null;
+    else if (entry?.id === "custom" && entry.builtin) next.defaultPreset = `builtin:${entry.builtin}`;
+    else if (entry?.id === "custom" && entry.custom) next.defaultPreset = `custom:${entry.custom}`;
+    else if (raw === "custom") next.defaultPreset = "custom";
+  }
+  // 指导开关与模式：enabled 控制是否启用，mode 控制内置（压缩器自己输出 [指导]）
+  // 还是外部（并发调用强模型）。旧卡片只发 advisor.enabled 时也折进来。
+  if (payload.guidance !== undefined) {
+    const raw = payload.guidance && typeof payload.guidance === "object" && !Array.isArray(payload.guidance) ? payload.guidance : {};
+    const out = {};
+    if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+    if (raw.mode === "builtin" || raw.mode === "external") out.mode = raw.mode;
+    next.guidance = out;
+  }
+  // 指导层：开关、路由、超时与条数上限。route 留空 = 跟随压缩器路由。
+  if (payload.advisor !== undefined) {
+    const raw = payload.advisor && typeof payload.advisor === "object" && !Array.isArray(payload.advisor) ? payload.advisor : {};
+    const out = {};
+    if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+    if (raw.route !== undefined) {
+      const route = raw.route && typeof raw.route === "object" && !Array.isArray(raw.route) ? raw.route : {};
+      const pick = (value) => (value === null ? null : typeof value === "string" ? value.trim() || null : undefined);
+      const provider = pick(route.provider);
+      const model = pick(route.model);
+      const nextRoute = {};
+      if (provider !== undefined) nextRoute.provider = provider;
+      if (model !== undefined) nextRoute.model = model;
+      if (Object.keys(nextRoute).length) out.route = nextRoute;
+    }
+    if (raw.effort !== undefined) {
+      const effort = normalizeEffort(raw.effort);
+      if (effort !== null) out.effort = effort;
+    }
+    if (raw.temperature === null) out.temperature = null;
+    else if (Number.isFinite(raw.temperature)) out.temperature = raw.temperature;
+    if (typeof raw.wait === "boolean") out.wait = raw.wait;
+    if (Number.isFinite(raw.maxTokens)) out.maxTokens = Math.floor(raw.maxTokens);
+    for (const key of ["timeoutMs", "maxAdvice", "maxChars"]) {
+      if (Number.isFinite(raw[key])) out[key] = Math.floor(raw[key]);
+    }
+    if (typeof raw.goal === "string") out.goal = raw.goal.slice(0, 400);
+    // 教师咨询：session 开关 + 冷却 + 深度范围 + 输入预算。
+    if (raw.teacher !== undefined) {
+      const teacher = raw.teacher && typeof raw.teacher === "object" && !Array.isArray(raw.teacher) ? raw.teacher : {};
+      const nextTeacher = {};
+      if (typeof teacher.enabled === "boolean") nextTeacher.enabled = teacher.enabled;
+      if (Number.isFinite(teacher.cooldownBlocks)) nextTeacher.cooldownBlocks = Math.max(0, Math.floor(teacher.cooldownBlocks));
+      if (Array.isArray(teacher.depthRange) && teacher.depthRange.length === 2) {
+        const low = Math.max(1, Math.min(5, Math.floor(Number(teacher.depthRange[0]) || 1)));
+        const high = Math.max(1, Math.min(5, Math.floor(Number(teacher.depthRange[1]) || 5)));
+        nextTeacher.depthRange = [Math.min(low, high), Math.max(low, high)];
+      }
+      if (Number.isFinite(teacher.inputBudget)) nextTeacher.inputBudget = Math.max(1000, Math.floor(teacher.inputBudget));
+      if (Number.isFinite(teacher.maxTokens)) nextTeacher.maxTokens = Math.max(200, Math.floor(teacher.maxTokens));
+      if (Number.isFinite(teacher.timeoutMs)) nextTeacher.timeoutMs = Math.max(3000, Math.floor(teacher.timeoutMs));
+      out.teacher = nextTeacher;
+    }
+    next.advisor = out;
+  }
+  // 改写器路由（算力卸载）：新形状是 `rewrite` 块；旧卡片发的顶层
+  // provider/model/reasoningEffort 折进同一个块，行为不变。
+  if (payload.rewrite !== undefined) {
+    next.rewrite = sanitizeRewrite(payload.rewrite);
+  } else if (payload.provider !== undefined || payload.model !== undefined || payload.reasoningEffort !== undefined) {
+    const legacy = {};
+    for (const key of ["provider", "model"]) {
+      if (payload[key] === null) legacy[key] = null;
+      else if (typeof payload[key] === "string") legacy[key] = payload[key].trim() || null;
+    }
+    const effort = normalizeEffort(payload.reasoningEffort);
+    if (effort !== null) legacy.effort = effort;
+    next.rewrite = legacy;
   }
   return next;
 }
@@ -273,6 +442,18 @@ function sanitizeStrategies(payload, current) {
     if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) continue;
     const next = { ...(out[id] ?? {}) };
     for (const [key, value] of Object.entries(overrides)) {
+      // 档位级路由覆盖：provider/model 是字符串（null = 删掉这一层，跟随上一级）。
+      if (key === "provider" || key === "model") {
+        if (value === null) {
+          delete next[key];
+          continue;
+        }
+        if (typeof value !== "string") continue;
+        const trimmed = value.trim();
+        if (trimmed) next[key] = trimmed;
+        else delete next[key];
+        continue;
+      }
       if (!Number.isFinite(value)) continue;
       next[key] = Math.max(key === "temperature" || key === "minRatio" ? 0 : 0, value);
     }
@@ -333,20 +514,32 @@ function describeEfforts(reasoning) {
  */
 function valueChoices(cfg = {}) {
   const listing = listPresets(cfg.presetDir);
-  const tiers = strategyCatalog().map((entry) => ({
-    value: entry.id,
-    label: entry.label,
-    family: entry.family,
-    isCustom: entry.family === "custom",
-  }));
+  // 压缩强度下拉只放三档 + 关闭：`custom` 不再是档位，而是叠加在提示词后面的用户注入。
+  const tiers = strategyCatalog()
+    .filter((entry) => entry.family !== "custom")
+    .map((entry) => ({
+      value: entry.id,
+      label: entry.label,
+      family: entry.family,
+    }));
   const presets = [];
+  // 内置预设排在最前面：多数人没有 presetDir，也不该被要求先写一份文件。
+  for (const preset of builtinPresetCatalog()) {
+    presets.push({ value: preset.value, label: preset.name, bytes: preset.bytes, kind: "builtin", summary: preset.summary });
+  }
   if (String(cfg.customText ?? "").trim()) {
-    presets.push({ value: "custom", label: "贴入的文本", bytes: null });
+    presets.push({ value: "custom", label: "贴入的文本", bytes: null, kind: "inline" });
   }
   for (const preset of listing.presets) {
-    presets.push({ value: `custom:${preset.name}`, label: preset.name, bytes: preset.bytes });
+    presets.push({ value: `custom:${preset.name}`, label: preset.name, bytes: preset.bytes, kind: "file" });
   }
-  return { tiers, presets, presetDirSet: listing.configured };
+  // 注入候选：空（不注入）+ 内置预设 + 贴入文本 + 目录文件。
+  // 与 presets 同源，但语义不同 —— 预设是"替代提示词"，注入是"追加一层规则"。
+  const injects = [
+    { value: "", label: "不注入", kind: "none" },
+    ...presets.map((entry) => ({ ...entry, value: entry.kind === "inline" ? "inline" : entry.value })),
+  ];
+  return { tiers, presets, injects, presetDirSet: listing.configured, builtinPresets: builtinPresetCatalog() };
 }
 
 /** 会话 id → agent preset（会话投影里的值）。取不到返回 undefined。 */
@@ -395,7 +588,8 @@ function renderStrategyPrompt(wanted, preset = null) {
   if (!strategy) return { ok: false, error: `unknown strategy: ${wanted.id}` };
   const limits = limitsMerge(strategy.id, {});
   // 自定义预设：把"哪份内容"塞进 limits，与真实请求走同一个 prepare。
-  if (preset) limits.preset = preset;
+  // 调用方传的是 `{ preset: {...} }` 包了一层；直接传描述对象也兼容。
+  if (preset) limits.preset = preset.preset ?? preset;
   try {
     const prepared = strategy.prepare(limits);
     if (prepared?.error) return { ok: false, error: prepared.error };
@@ -420,6 +614,57 @@ function limitsMerge(id, overrides) {
   const strategy = strategyById(id);
   if (!strategy) return {};
   return { ...strategy.defaults, ...(overrides ?? {}) };
+}
+
+/**
+ * 保存后的路由体检：只报警、不拒绝。
+ *
+ * 目录可能离线、provider 可能稍后才注册 —— 把一次目录抖动变成"保存失败"
+ * 会让用户以为配置写坏了。真正的失败在账本里（`thinking-failed` /
+ * `rewrite-route-fallback`），这里只负责把"选了个不存在的路由"提前说出来。
+ */
+async function routeWarnings(ctx, cfg) {
+  const out = [];
+  const llm = (typeof ctx.get === "function" ? ctx.get("llm") : undefined) ?? ctx?.llm;
+  if (!llm) return out;
+
+  let providers = [];
+  try {
+    providers = (llm.listProviders?.() ?? []).map((entry) => entry?.id).filter(Boolean);
+  } catch {
+    /* 目录不可用就别据此报警 */
+  }
+
+  const targets = [];
+  const global = cfg?.rewrite;
+  if (global && typeof global === "object" && global.provider) {
+    targets.push({ where: "改写器路由", provider: global.provider, model: global.model });
+  }
+  for (const [id, overrides] of Object.entries(cfg?.strategies ?? {})) {
+    if (overrides && typeof overrides === "object" && overrides.provider) {
+      targets.push({ where: `档位 ${id}`, provider: overrides.provider, model: overrides.model });
+    }
+  }
+
+  // 逐条串行解析会把保存拖到 8s×N；这些检查互相独立，并行做，总超时仍是单条的量级。
+  const checks = targets.map(async (target) => {
+    if (!target.model) {
+      return `${target.where}：只填了 provider、没有 model —— 这条路由不生效，会继续往下掉一层`;
+    }
+    if (providers.length > 0 && !providers.includes(target.provider)) {
+      return `${target.where}：provider「${target.provider}」不在宿主注册表里（可用：${providers.slice(0, 6).join(" / ")}）`;
+    }
+    if (typeof llm.resolveModelInfo !== "function") return null;
+    try {
+      await withTimeout(llm.resolveModelInfo(target.provider, target.model), CATALOG_TIMEOUT_MS, "resolveModelInfo");
+      return null;
+    } catch (error) {
+      return `${target.where}：${target.provider}/${target.model} 解析失败 —— ${String(error?.message ?? error)}`;
+    }
+  });
+  const results = await Promise.all(checks);
+  for (const line of results) if (line) out.push(line);
+  return out;
 }
 
 function doRegister(ctx, ws, store, deps = {}) {
@@ -469,8 +714,10 @@ function doRegister(ctx, ws, store, deps = {}) {
         if (payload.sessions !== undefined) patch.sessions = strategyTable(payload.sessions);
         if (payload.strategies !== undefined) patch.strategies = sanitizeStrategies(payload.strategies, current.strategies);
         const saved = store.save(patch);
+        // 路由体检只报警：目录离线或 provider 稍后才注册，不该让保存失败。
+        const warnings = await routeWarnings(ctx, saved);
         const { path: _omit, ...safe } = saved;
-        sendJson(res, 200, { ok: true, config: safe });
+        sendJson(res, 200, { ok: true, config: safe, ...(warnings.length > 0 ? { warnings } : {}) });
         return;
       }
       sendJson(res, 405, { error: "method not allowed" });
@@ -502,7 +749,9 @@ function doRegister(ctx, ws, store, deps = {}) {
       const preset = url.searchParams.get("agentPreset");
       // 卡片要能回答"为什么这个会话现在用的是这一档"：把解析结果与来源一起回。
       const resolved = sessionId || preset ? resolveConfig(cfg, { sessionId, agentPreset: preset }).route : null;
-      sendJson(res, 200, { config: safe, events: redactEvents(tailEvents(25)), ...catalogPayload(store), resolved });
+      // 卡片要能对比"会话现在走哪条路由"与"压缩器卸载到哪条路由"。
+      const sessionRoute = typeof deps.getRoute === "function" ? deps.getRoute() : null;
+      sendJson(res, 200, { config: safe, events: redactEvents(tailEvents(25)), ...catalogPayload(store), resolved, sessionRoute });
     } catch (error) {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
@@ -540,6 +789,15 @@ function doRegister(ctx, ws, store, deps = {}) {
           choices: valueChoices(cfg),
           /** 这个会话自己那条覆盖（没配就是 null）。 */
           override: cfg.sessions?.[sessionId] ?? null,
+          /** 指导：全局默认 + 本会话解析后的实际值（头部下拉要用）。 */
+          guidance: {
+            global: cfg.guidance ?? { enabled: false, mode: "external" },
+            effective: effective.guidance ?? null,
+          },
+          teacher: {
+            global: cfg.advisor?.teacher?.enabled === true,
+            effective: effective.teacher?.enabled === true,
+          },
           /** 它所属 preset 的映射（没配就是 null）。 */
           presetStrategy: agentPreset ? cfg.agentPresets?.[agentPreset] ?? null : null,
         });
@@ -567,19 +825,97 @@ function doRegister(ctx, ws, store, deps = {}) {
           sendJson(res, 400, { error: "sessionId is required" });
           return;
         }
-        // `strategy` 是档位名（或 `custom[:预设名]`），`null` 表示清除这层覆盖。
+        // `strategy` 是档位名（或 `custom[:预设名]` / `builtin:名字` / 对象形态），
+        // `null` 表示清除这层覆盖。`preset` 只在 custom 档位下生效 ——
+        // 会话级 prompt 是"这一档用哪份规格"，不是独立的第五档。
+        // `strategy` 缺省 = "只改指导，档位不动"：第三方脚本或未来的卡片入口
+        // 只想切建议模式时不该被迫重发档位。
+        const strategyAbsent = payload.strategy === undefined;
         const cleared = payload.strategy === null || payload.strategy === "";
-        const entry = cleared ? null : normalizeRouteEntry(payload.strategy);
-        if (!cleared && !entry) {
+        const raw = cleared || strategyAbsent
+          ? null
+          : payload.preset !== undefined && payload.preset !== null && payload.preset !== ""
+            ? { strategy: payload.strategy, preset: payload.preset }
+            : payload.strategy;
+        const entry = cleared || strategyAbsent ? null : normalizeRouteEntry(raw);
+        if (!cleared && !strategyAbsent && !entry) {
           sendJson(res, 400, { error: `unknown strategy: ${JSON.stringify(payload.strategy)}` });
+          return;
+        }
+        // 两个字段都不给 = 没有可改的东西。
+        if (strategyAbsent && payload.guidance === undefined && payload.teacher === undefined) {
+          sendJson(res, 400, { error: "strategy, guidance or teacher is required" });
+          return;
+        }
+        if (!cleared && !strategyAbsent && entry.builtin && !builtinPresetById(entry.builtin)) {
+          sendJson(res, 400, { error: `unknown preset: ${entry.builtin}` });
           return;
         }
         const cfg = store.load();
         const sessions = { ...(cfg.sessions ?? {}) };
-        // `null` = 回到"跟随 preset / 全局默认"，这正是"清除本会话覆盖"的语义。
-        if (!entry) delete sessions[sessionId];
-        else if (entry.id === "custom") sessions[sessionId] = entry.custom ? `custom:${entry.custom}` : "custom";
-        else sessions[sessionId] = entry.id;
+        // 会话级指导覆盖：与档位独立。`null` = 跟随全局；不传 = 保持原值。
+        const hasGuidance = payload.guidance !== undefined;
+        let guidancePatch;
+        if (hasGuidance) {
+          if (payload.guidance === null) guidancePatch = null;
+          else if (payload.guidance && typeof payload.guidance === "object" && !Array.isArray(payload.guidance)) {
+            const nextGuidance = {};
+            if (typeof payload.guidance.enabled === "boolean") nextGuidance.enabled = payload.guidance.enabled;
+            if (payload.guidance.mode === "builtin" || payload.guidance.mode === "external") nextGuidance.mode = payload.guidance.mode;
+            guidancePatch = Object.keys(nextGuidance).length ? nextGuidance : undefined;
+          }
+        }
+        // 会话级教师开关：与指导覆盖同样独立（null = 跟随全局，不传 = 保持原值）。
+        const hasTeacher = payload.teacher !== undefined;
+        let teacherPatch;
+        if (hasTeacher) {
+          if (payload.teacher === null) teacherPatch = null;
+          else if (payload.teacher && typeof payload.teacher === "object" && !Array.isArray(payload.teacher)) {
+            if (typeof payload.teacher.enabled === "boolean") teacherPatch = { enabled: payload.teacher.enabled };
+          }
+        }
+        const existing = sessions[sessionId];
+        const existingGuidance = existing && typeof existing === "object" && !Array.isArray(existing) ? existing.guidance : undefined;
+        const existingTeacher = existing && typeof existing === "object" && !Array.isArray(existing) ? existing.teacher : undefined;
+        // 三部分（档位 / 指导 / 教师）各自独立：`null` = 清除并跟随全局，
+        // 缺省 = 保留原值。合成一条覆盖再落盘，避免三套 if-else 各漏一处。
+        const keepStrategy = strategyAbsent
+          ? (existing && typeof existing === "object" && !Array.isArray(existing)
+              ? (existing.strategy !== undefined
+                  ? existing
+                  : existing.preset !== undefined ? { strategy: "custom", preset: existing.preset } : null)
+              : existing ?? null)
+          : cleared
+            ? null
+            : entry
+              ? entry.id === "custom" && entry.builtin
+                ? { strategy: "custom", preset: `builtin:${entry.builtin}` }
+                : entry.id === "custom"
+                  ? (entry.custom ? `custom:${entry.custom}` : "custom")
+                  : entry.id
+              : null;
+        const nextGuidance = guidancePatch === undefined ? existingGuidance : guidancePatch;
+        const nextTeacher = teacherPatch === undefined ? existingTeacher : teacherPatch;
+
+        let merged;
+        if (keepStrategy && typeof keepStrategy === "object") {
+          merged = { ...keepStrategy };
+        } else if (typeof keepStrategy === "string") {
+          merged = { strategy: keepStrategy };
+        } else {
+          merged = {};
+        }
+        if (nextGuidance === undefined || nextGuidance === null) delete merged.guidance;
+        else merged.guidance = nextGuidance;
+        if (nextTeacher === undefined || nextTeacher === null) delete merged.teacher;
+        else merged.teacher = nextTeacher;
+
+        const hasStrategy = merged.strategy !== undefined;
+        const hasExtra = merged.guidance !== undefined || merged.teacher !== undefined;
+        if (!hasStrategy && !hasExtra) delete sessions[sessionId];
+        // 没有额外覆盖时保持旧形态（字符串），避免把整张表都改成对象。
+        else if (!hasExtra && typeof keepStrategy === "string") sessions[sessionId] = keepStrategy;
+        else sessions[sessionId] = merged;
         store.save({ sessions });
         // 前端不一定传 preset；查不到就当"少一层映射"，不影响会话覆盖生效。
         const preset = payload.agentPreset ?? agentPresetOf(ctx, sessionId);
@@ -727,7 +1063,7 @@ function doRegister(ctx, ws, store, deps = {}) {
           : { text: String(cfg.customText ?? ""), error: String(cfg.customText ?? "").trim() ? null : "还没贴入任何文本" };
         const strategy = strategyById("custom");
         const rendered = source.text
-          ? renderStrategyPrompt({ id: "custom" }, { preset: presetName ? { name: presetName, dir } : { inline: source.text } })
+          ? renderStrategyPrompt({ id: "custom" }, { preset: presetName ? { name: presetName, dir: cfg.presetDir } : { inline: source.text } })
           : { ok: false, error: source.error };
         sendJson(res, 200, {
           id: "custom",
@@ -925,10 +1261,18 @@ function doRegister(ctx, ws, store, deps = {}) {
     // （改档位之前先验一次，比改完回会话里试便宜）。
     const wanted = strategyValue(payload.strategy ?? null);
     const cfgNow = store.load();
-    const requestedId = typeof wanted === "string" ? wanted : null;
-    const scoped = requestedId
-      ? resolveConfig({ ...cfgNow, strategy: requestedId }, { sessionId: payload.sessionId ?? undefined, agentPreset: payload.agentPreset ?? undefined })
-      : resolveConfig(cfgNow, { sessionId: payload.sessionId ?? undefined, agentPreset: payload.agentPreset ?? undefined });
+    // 预设形态（`{ strategy: "custom", preset: "builtin:x" }`）也要真的测那一份：
+    // 之前这里只认字符串，选"测试：标准结构化压缩"会静默测全局默认档，结果不可信。
+    const requestedId = typeof wanted === "string"
+      ? wanted
+      : wanted && typeof wanted === "object" && typeof wanted.strategy === "string"
+        ? wanted.strategy
+        : null;
+    const requestedPreset = wanted && typeof wanted === "object" && typeof wanted.preset === "string" ? wanted.preset : null;
+    const tempCfg = requestedId
+      ? { ...cfgNow, strategy: requestedId, ...(requestedPreset ? { defaultPreset: requestedPreset } : {}) }
+      : cfgNow;
+    const scoped = resolveConfig(tempCfg, { sessionId: payload.sessionId ?? undefined, agentPreset: payload.agentPreset ?? undefined });
     const cfg = scoped;
     const strategy = strategyById(cfg.strategy);
 
@@ -936,11 +1280,15 @@ function doRegister(ctx, ws, store, deps = {}) {
     // test has no request to follow. index.mjs records the last agent-loop route
     // for exactly this case.
     const lastRoute = typeof deps.getRoute === "function" ? deps.getRoute() : null;
-    const provider = cfg.provider || lastRoute?.provider || null;
-    const model = cfg.model || lastRoute?.model || null;
+    // 与真实链路同一套解析：档位覆盖 > rewrite 块 > 跟随最近一次 agent-loop 路由。
+    // 自测必须走这条，否则"测的是会话路由、跑的是卸载路由"就是假绿。
+    const route = resolveRewriteRoute(cfg, cfg.strategy, lastRoute);
+    const provider = route.provider;
+    const model = route.model;
     if (!provider || !model) {
       sendJson(res, 409, {
         ok: false,
+        routeSource: route.source,
         error: "还没有可用的改写路由：在卡片里选一个 provider/model，或先在本会话发一条消息（插件会记住当前请求路由）。",
       });
       return;
@@ -970,6 +1318,8 @@ function doRegister(ctx, ws, store, deps = {}) {
         strategy: cfg.strategy,
         provider,
         model,
+        routeSource: route.source,
+        offloaded: route.source !== "session",
         charsIn: input.length,
         charsOut: 0,
         text: null,
@@ -980,10 +1330,22 @@ function doRegister(ctx, ws, store, deps = {}) {
       return;
     }
 
+    // 自测可以点名指导模式：`guidance` 覆盖本次解析结果，便于分别测两种模式。
+    const guidanceOverride = payload.guidance && typeof payload.guidance === "object" && !Array.isArray(payload.guidance)
+      ? {
+          enabled: typeof payload.guidance.enabled === "boolean" ? payload.guidance.enabled : cfg.guidance?.enabled === true,
+          mode: payload.guidance.mode === "builtin" || payload.guidance.mode === "external"
+            ? payload.guidance.mode
+            : cfg.guidance?.mode ?? "external",
+        }
+      : cfg.guidance;
+    const testCfg = { ...cfg, guidance: guidanceOverride, archive: false };
+    // 报文留痕：prompt / 原始输出 / finish / usage，供 Log 窗口比对。
+    const trace = [];
     let result = null;
     try {
       result = await withTimeout(
-        deps.rewrite(input, { provider, model, sessionId: "iot-thinking-self-test" }, { ...cfg, archive: false }, 0, {}),
+        deps.rewrite(input, { provider, model, sessionId: "iot-thinking-self-test" }, testCfg, 0, { trace }),
         SELF_TEST_TIMEOUT_MS,
         "self-test",
       );
@@ -1005,6 +1367,10 @@ function doRegister(ctx, ws, store, deps = {}) {
         : null;
     const candidate = typeof result === "string" ? result : result?.text;
     const text = typeof candidate === "string" ? candidate.trim() : "";
+    // 指导是替换判定之后才追加的：判定用主体，展示用"主体 + 指导"。
+    // 之前这里把 advice 丢了，所以"开了外部指导但测试看不到指导"。
+    const advice = typeof result === "string" ? null : result?.advice ?? null;
+    const displayText = advice ? appendAdvice(text, advice) : text;
     // The same rule stream.mjs applies before it may substitute a block.
     const accepted = strategy.accepts(input, candidate, cfg.limits);
     const reason = accepted
@@ -1021,19 +1387,27 @@ function doRegister(ctx, ws, store, deps = {}) {
       strategy: cfg.strategy,
       provider,
       model,
+      routeSource: route.source,
+      offloaded: route.source !== "session",
       charsIn: input.length,
-      charsOut: text.length,
-      text: text || null,
+      charsOut: displayText.length,
+      text: displayText || null,
+      advice: advice || null,
+      charsOutBody: text.length,
       effort: result?.event?.effort ?? null,
       effortFallback: result?.event?.effortFallback === true,
       minChars,
       maxChars,
       ms: Date.now() - started,
+      // 指导：本次实际用的开关与模式；trace 是完整报文留痕（Log 窗口用）。
+      guidance: guidanceOverride ?? null,
+      trace,
       ...(lastFailure?.message ? { error: String(lastFailure.message) } : {}),
       event: result?.event
         ? {
             strategy: result.event.strategy,
             finish: result.event.finish,
+            usage: result.event.usage ?? null,
             retried: result.event.retried,
             fallback: result.event.fallback,
           }

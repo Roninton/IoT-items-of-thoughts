@@ -4,6 +4,8 @@
 // 不 import dsh，自测可以用假 source 直接驱动。
 
 import { DEFAULT_STRATEGY, isShorterReplacement, strategyById } from "./strategies.mjs";
+import { appendAdvice } from "./advisor.mjs";
+import { noteBlock } from "./teacher.mjs";
 
 export { isShorterReplacement };
 
@@ -34,8 +36,16 @@ export async function* transformStream(source, options, deps) {
     return;
   }
 
-  if (!cfg?.enabled || !deps.shouldTransform(options)) {
-    yield* source;
+  const agentRequest = deps.shouldTransform(options);
+  if (!cfg?.enabled || !agentRequest) {
+    // 压缩 off 仍可单独咨询教师：只推进冷却，不缓冲/改写/注入建议。
+    // teacherActive 由入口用原始全局总闸计算，不把 off 的 resolved.enabled 当总闸。
+    if (agentRequest && cfg?.teacherActive === true && cfg.strategy === "off") {
+      for await (const chunk of source) {
+        if (chunk?.type === "block-end" && chunk.block?.type === "reasoning") noteBlock(options?.sessionId);
+        yield chunk;
+      }
+    } else yield* source;
     return;
   }
 
@@ -102,6 +112,8 @@ export async function* transformStream(source, options, deps) {
     // transformer stays testable with a trivial rewriter.
     const candidate = typeof rewritten === "string" ? rewritten : rewritten?.text;
     const candidateEvent = typeof rewritten === "string" ? null : rewritten?.event ?? null;
+    // 指导只在替换判定**之后**追加：它不能把候选撑长，否则 shorter 档位会拒掉。
+    const advice = typeof rewritten === "string" ? null : rewritten?.advice ?? null;
     // 判定要带上 limits：自定义预设的替换规则（shorter / different）是配置出来的，
     // 不在策略常量里。
     const accepted = strategy.accepts(original, candidate, cfg.limits);
@@ -129,7 +141,22 @@ export async function* transformStream(source, options, deps) {
       return false;
     }
 
-    const text = candidate.trim();
+    const body = candidate.trim();
+    const withAdvice = appendAdvice(body, advice);
+    const text = withAdvice;
+    // Full-log mode requires durable original AND processed records before replacement.
+    if (deps.beforeReplace) {
+      let archived = false;
+      try { archived = await deps.beforeReplace({ index, original, processed: text, advice, strategy: strategy.id }); }
+      catch (error) { emit('block-archive-failed', { index, message: String(error?.message ?? error) }); }
+      if (!archived) {
+        emit('block-kept', { index, reason: 'session-log-unavailable', strategy: strategy.id });
+        yield* flush(index);
+        yield block;
+        return false;
+      }
+    }
+    if (advice) emit("advisor-appended", { index, adviceLines: String(advice).split("\n\n").length, charsAdded: withAdvice.length - body.length });
     yield { type: "reasoning-delta", index, text };
     yield { ...block, type: "block-end", index, block: { ...block.block, text } };
     buffers.delete(index);
@@ -164,8 +191,22 @@ export async function* transformStream(source, options, deps) {
       const buffered = buffers.get(chunk.index);
       // A block-end without deltas still carries its assembled text.
       if (buffered || String(chunk.block.text ?? "").trim()) {
+        // Runtime context on the next admitted request reads the completed-block count.
         yield* replace(chunk.index, chunk, buffered);
+        // CD 按"块"计量：块结束就推进，与这一块是否被替换、是否有内容无关。
+        // 空块也算一块 —— 否则长会话里空块会让冷却永远走不完。
+        try {
+          noteBlock(options?.sessionId);
+        } catch {
+          /* 状态推进失败不该影响主流程 */
+        }
         continue;
+      }
+      // 空块：仍然是一块结束，CD 要推进。
+      try {
+        noteBlock(options?.sessionId);
+      } catch {
+        /* 状态推进失败不该影响主流程 */
       }
     }
 

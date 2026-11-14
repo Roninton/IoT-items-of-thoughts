@@ -5,7 +5,8 @@
  *   node selftest.mjs
  */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import vm from "node:vm";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,10 +24,13 @@ import {
   isDegenerateItems,
   sanitizeDraft,
 } from "./lib/think.mjs";
-import { compressThinking, EFFORT_PROBE } from "./lib/compress.mjs";
+import { compressThinking, EFFORT_PROBE, REWRITE_BUDGET, REWRITE_TIMEOUT } from "./lib/compress.mjs";
+import { DEFAULTS } from "./lib/config-store.mjs";
 import {
   AUTO_EFFORT,
+  describeError,
   EFFORT_IDS,
+  errorCodeOf,
   isUnsupportedEffortFailure,
   knownEffortPlan,
   normalizeEffort,
@@ -39,7 +43,12 @@ import { defaultNodeModulesRoots, rootFromEntryPath, versionedRoots } from "./li
 import { guardRequest, redactEvents, registerConfigApi } from "./lib/config-api.mjs";
 import { mark } from "./lib/ledger.mjs";
 import { ConfigStore } from "./lib/config-store.mjs";
-import { migrateLegacyConfig, resolveConfig, resolveRoute, strategyCatalog } from "./lib/route.mjs";
+import { hasLabel } from "./lib/gates.mjs";
+import { outputDiscipline } from "./lib/think.mjs";
+import { ADVISOR_LABEL, advise, appendAdvice, buildAdvisorPrompt, formatAdvice, resolveAdvisorRoute } from "./lib/advisor.mjs";
+import { builtinPresetText } from "./lib/builtin-presets.mjs";
+import { BUILTIN_PRESETS, builtinPresetById, builtinPresetCatalog } from "./lib/builtin-presets.mjs";
+import { migrateLegacyConfig, migrateRewriteConfig, resolveConfig, resolveRewriteRoute, resolveRoute, strategyCatalog } from "./lib/route.mjs";
 import {
   DEFAULT_STRATEGY,
   LEGACY_PROFILE_TO_STRATEGY,
@@ -50,7 +59,24 @@ import {
   strategyIds,
 } from "./lib/strategies.mjs";
 import { switchSessionStrategy } from "./lib/switch.mjs";
-import { buildCustomPrompt, listPresets, readPreset, resolvePresetDir, writePreset } from "./lib/custom.mjs";
+import { buildCustomPrompt, injectTextOf, listPresets, readPreset, resolvePresetDir, writePreset } from "./lib/custom.mjs";
+import {
+  ASK_KINDS,
+  adviceMuted,
+  buildTeacherPrompt,
+  canConsult,
+  clearTeacherState,
+  consultTeacher,
+  extractSessionContext,
+  formatTeacherStatus,
+  normalizeTeacherLimits,
+  markConsulted,
+  noteBlock,
+  releaseConsult,
+  reserveConsult,
+  resetTeacherState,
+  teacherStatus,
+} from "./lib/teacher.mjs";
 
 let failures = 0;
 async function check(name, fn) {
@@ -59,7 +85,7 @@ async function check(name, fn) {
     console.log(`ok   ${name}`);
   } catch (error) {
     failures += 1;
-    console.log(`FAIL ${name}\n     ${error.message}`);
+    console.log(`FAIL ${name}\n     ${error.stack ?? error.message}`);
   }
 }
 
@@ -86,7 +112,40 @@ const deps = (rewrite, overrides = {}) => ({
   onEvent: () => {},
 });
 
+/**
+ * 真实宿主的 `createUserMessage` 要的是对象（content 数组）；直接传字符串会抛
+ * `content is not iterable`。测试替身必须同样严格 —— 否则这个 bug 测不出来。
+ */
+function strictCreateUserMessage(input) {
+  const content = input && typeof input === "object" && "content" in input ? input.content : input;
+  if (typeof content === "string") throw new TypeError("content is not iterable");
+  return { role: "user", content };
+}
+
 const source = () => chunks([start(), delta("abcde"), delta("fghij"), end("abcdefghij"), textDelta("hello"), finish()]);
+
+await check("教师状态不写入 thinking，冷却仍按块递减到恢复", async () => {
+  resetTeacherState();
+  const teacher = { enabled: true, depthRange: [1, 5], cooldownBlocks: 3 };
+  const options = { ...baseOptions, sessionId: "stream-teacher" };
+  const cfg = { ...baseConfig, teacher };
+  const run = async () => {
+    const out = await collect(transformStream(
+      chunks([start(), delta("abcdefghij"), end("abcdefghij"), textDelta("正文"), finish()]),
+      options,
+      { shouldTransform: () => true, getConfig: () => cfg, rewrite: async () => "· X", onEvent: () => {} },
+    ));
+    return out.find((chunk) => chunk.type === "block-end")?.block?.text ?? "";
+  };
+  assert.equal(await run(), "· X", "thinking must not receive teacher state");
+  markConsulted("stream-teacher", { cooldownBlocks: 3 });
+  for (const remaining of [2, 1, 0]) {
+    assert.equal(await run(), "· X");
+    assert.equal(teacherStatus("stream-teacher").remainingBlocks, remaining);
+  }
+  assert.equal(canConsult("stream-teacher"), true);
+  resetTeacherState();
+});
 
 await check("完成块被压缩替换：不再出现原始 deltas", async () => {
   const out = await collect(transformStream(source(), baseOptions, deps(async () => "· X")));
@@ -344,7 +403,7 @@ await check("压缩器退化输出会严格重试，成功后返回新节点", a
         return this.text ? [{ type: "text", text: this.text }] : [];
       }
     },
-    createUserMessage: (input) => input,
+    createUserMessage: strictCreateUserMessage,
   };
   const ctx = {
     llm: {
@@ -381,7 +440,7 @@ await check("压缩器退化输出会严格重试，成功后返回新节点", a
 await check("退化草稿不调用模型，直接走确定性兜底", async () => {
   let calls = 0;
   const events = [];
-  const Llm = { BlockAssembler: class {}, createUserMessage: (input) => input };
+  const Llm = { BlockAssembler: class {}, createUserMessage: strictCreateUserMessage };
   const ctx = {
     llm: {
       stream: () => {
@@ -417,7 +476,7 @@ await check("非退化但 sanitize 后为空：不调模型，也不硬造节点
   assert.equal(sanitizeDraft(draft), "");
   let calls = 0;
   const events = [];
-  const Llm = { BlockAssembler: class {}, createUserMessage: (input) => input };
+  const Llm = { BlockAssembler: class {}, createUserMessage: strictCreateUserMessage };
   const ctx = {
     llm: {
       stream: () => {
@@ -525,24 +584,27 @@ await check("seam 锚点：版本化安装按 mtime 降序、忽略非 dsh- 目�
 await check("seam 锚点：argv[1] 推导排在 profiles/node_modules 之前", () => {
   // 多版本共存：profiles/node_modules 里可能 hoist 着另一个 dsh 版本的 seam。
   // 先命中它 = 插件与宿主拿到两份不同实例 —— 必须让"正在跑的入口"先赢。
+  // 比较前把分隔符归一：这组用例写的是 Windows 路径，但仓库也要能在 POSIX 上跑。
+  const norm = (value) => String(value).replace(/\\/g, "/");
   const roots = defaultNodeModulesRoots({
     entry: "D:\\dsh-home\\dsh-0.2.1-rc.2\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js",
     home: "D:\\dsh-home",
     fs: { readdirSync: () => [], statSync: () => ({ mtimeMs: 0 }) },
   });
-  assert.equal(roots[0], "D:\\dsh-home\\dsh-0.2.1-rc.2\\node_modules");
-  const profilesAt = roots.indexOf("D:\\dsh-home\\profiles\\node_modules");
+  assert.equal(norm(roots[0]), "D:/dsh-home/dsh-0.2.1-rc.2/node_modules");
+  const profilesAt = roots.findIndex((root) => norm(root) === "D:/dsh-home/profiles/node_modules");
   assert.ok(profilesAt > 0, "profiles 根仍在候选里，只是排在后面");
-  assert.ok(!roots.slice(0, profilesAt).some((r) => r.endsWith("profiles\\node_modules")));
+  assert.ok(!roots.slice(0, profilesAt).some((root) => norm(root) === "D:/dsh-home/profiles/node_modules"));
 });
 
 await check("seam 锚点：入口落空时才用 profiles 根", () => {
+  const norm = (value) => String(value).replace(/\\/g, "/");
   const roots = defaultNodeModulesRoots({
     entry: "D:\\tmp\\not-under-node-modules\\selftest.mjs",
     home: "D:\\dsh-home",
     fs: { readdirSync: () => [], statSync: () => ({ mtimeMs: 0 }) },
   });
-  assert.equal(roots[0], "D:\\dsh-home\\profiles\\node_modules");
+  assert.equal(norm(roots[0]), "D:/dsh-home/profiles/node_modules");
 });
 
 await check("config API 门禁：缺自定义头一律 403", () => {
@@ -659,7 +721,7 @@ const fakeLlm = () => ({
       return this.text ? [{ type: "text", text: this.text }] : [];
     }
   },
-  createUserMessage: (input) => input,
+  createUserMessage: strictCreateUserMessage,
 });
 
 const compressWith = (ctx, { cfg = {}, events = [], text = DRAFT } = {}) =>
@@ -1352,7 +1414,7 @@ const ROUTE_CFG = {
   sessions: { "s-boss": "iot-compact" },
 };
 
-await check("策略目录：七个策略（含第 4 项自定义），id 唯一，默认策略在其中", () => {
+await check("策略目录：五个策略（三档压缩 + 用户配置 + 关闭），id 唯一，默认策略在其中", () => {
   const ids = strategyIds();
   assert.deepEqual(ids, ["iot-compact", "iot-balanced", "iot-full", "custom", "off"]);
   assert.equal(new Set(ids).size, ids.length);
@@ -1474,6 +1536,1638 @@ await check("迁移必须删掉旧平铺字段，否则切档位时它们会复�
   assert.equal(migrateLegacyConfig(handWritten), handWritten);
 });
 
+// ── 改写器路由（算力卸载） ────────────────────────────────────────────────
+await check("改写器路由：档位覆盖 > rewrite 块 > 跟随会话", () => {
+  const session = { provider: "session-p", model: "session-m" };
+  const fromStrategy = resolveRewriteRoute(
+    { rewrite: { provider: "local-p", model: "small" }, strategies: { "iot-compact": { provider: "cheap-p", model: "tiny" } } },
+    "iot-compact",
+    session,
+  );
+  assert.deepEqual([fromStrategy.provider, fromStrategy.model, fromStrategy.source], ["cheap-p", "tiny", "strategy"]);
+
+  const fromConfig = resolveRewriteRoute({ rewrite: { provider: "local-p", model: "small" } }, "iot-full", session);
+  assert.deepEqual([fromConfig.provider, fromConfig.model, fromConfig.source], ["local-p", "small", "config"]);
+
+  const follow = resolveRewriteRoute({ rewrite: { provider: null, model: null } }, "iot-full", session);
+  assert.deepEqual([follow.provider, follow.model, follow.source], ["session-p", "session-m", "session"]);
+
+  const none = resolveRewriteRoute({}, "iot-full", null);
+  assert.equal(none.source, "none");
+  assert.equal(none.provider, null);
+});
+
+await check("改写器路由：只填 provider 不算配了，继续往下掉一层", () => {
+  const route = resolveRewriteRoute(
+    { rewrite: { provider: "local-p", model: "" }, strategies: { "iot-full": { provider: "half-p" } } },
+    "iot-full",
+    { provider: "session-p", model: "session-m" },
+  );
+  assert.equal(route.source, "session", "半条路由不该被当成卸载目标");
+  assert.equal(route.provider, "session-p");
+});
+
+/** 客户端 bundle 是 plain JS，靠 __ModuleLoader__ 加载；这里用最小垫片取纯函数。 */
+function loadClientBundle() {
+  const source = readFileSync(join(process.cwd(), "lib", "client.js"), "utf8");
+  let definition = null;
+  const context = vm.createContext({
+    window: { __ModuleLoader__: { load: (value) => { definition = value; } } },
+    console,
+  });
+  vm.runInContext(source, context, { filename: "client.js" });
+  assert.ok(definition, "client bundle 应调用 __ModuleLoader__.load");
+  const reactStub = { useState: () => [null, () => {}], useEffect: () => {}, useRef: () => ({ current: true }), createElement: () => null };
+  return definition.factory((name) => (name === "react" ? reactStub : {}));
+}
+
+await check("预设选择：切到自定义档位时不能沿用旧档位的值（否则选了预设但不生效）", () => {
+  const client = loadClientBundle();
+  const first = () => "custom:first";
+  assert.equal(client.composeTier("custom", "iot-balanced", first), "custom:first", "旧档位值不能被当成预设名");
+  assert.equal(client.composeTier("custom", "custom:mine", first), "custom:mine", "已是 custom 形态则沿用");
+  assert.equal(client.composeTier("custom", "custom", first), "custom", "贴入文本也沿用");
+  assert.equal(client.composeTier("iot-full", "custom:mine", first), "iot-full", "非 custom 档位原样返回");
+});
+
+/** 驱动真实头部回调，而不是绕过客户端直接测试 PUT。 */
+function mountStrategySeat(initial, fetch) {
+  let definition;
+  const states = [initial, null, false];
+  let cursor = 0;
+  const effects = [];
+  const react = {
+    useState(value) {
+      const index = cursor++;
+      if (!(index in states)) states[index] = value;
+      return [states[index], (next) => { states[index] = typeof next === "function" ? next(states[index]) : next; }];
+    },
+    useEffect: (effect) => { effects.push(effect); },
+    useRef: () => ({ current: true }),
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+  };
+  vm.runInNewContext(readFileSync(new URL("./lib/client.js", import.meta.url), "utf8"), {
+    window: { __ModuleLoader__: { load: (value) => { definition = value; } } }, fetch, console,
+  });
+  const client = definition.factory((name) => name === "react" ? react : {});
+  return {
+    states,
+    effects,
+    render(sessionId) {
+      cursor = 0;
+      effects.length = 0;
+      const tree = client.IotStrategySeat({ sessionId });
+      const selects = [];
+      const walk = (node) => {
+        if (!node || typeof node !== "object") return;
+        if (node.type === "select") selects.push(node);
+        for (const child of node.children ?? []) walk(child);
+      };
+      walk(tree);
+      return selects;
+    },
+  };
+}
+
+await check("真实教师下拉：开/关/跟随只改教师，保留关闭档位与自定义规格", async () => {
+  for (const original of ["off", { strategy: "custom", preset: "builtin:deep", guidance: { enabled: false } }]) {
+    for (const value of ["on", "off", "follow"]) {
+      const ws = fakeWebServer();
+      const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-teacher-ui-")), "config.json"));
+      store.save({ strategy: "iot-full", sessionSwitch: true, sessions: { s: original } });
+      registerConfigApi(testCtx(ws), store);
+      const before = await ws.call("/iot-thinking/api/session", { url: "/iot-thinking/api/session?sessionId=s" });
+      const requests = [], pending = [];
+      const seat = mountStrategySeat(before.payload, (url, options) => {
+        requests.push(JSON.parse(options.body));
+        const promise = ws.call(url, { method: options.method, body: options.body })
+          .then((response) => ({ ok: response.statusCode === 200, json: async () => response.payload }));
+        pending.push(promise);
+        return promise;
+      });
+      const teacher = seat.render("s").find((select) => select.props.title?.includes("教师开关"));
+      assert.ok(teacher);
+      teacher.props.onChange({ target: { value } });
+      await Promise.all(pending);
+      assert.equal(Object.hasOwn(requests[0], "strategy"), false, "教师回调必须省略 strategy，不是传 null");
+      assert.equal(Object.hasOwn(requests[0], "preset"), false);
+      const after = await ws.call("/iot-thinking/api/session", { url: "/iot-thinking/api/session?sessionId=s" });
+      assert.equal(after.payload.route.id, before.payload.route.id);
+      assert.equal(after.payload.enabled, before.payload.enabled);
+      if (typeof original === "object") {
+        assert.equal(after.payload.override.preset, original.preset);
+        assert.deepEqual(after.payload.override.guidance, original.guidance);
+      }
+    }
+  }
+});
+
+await check("新会话教师选择：与待落盘档位合并，显式清除档位仍发送 null", async () => {
+  const requests = [];
+  const seat = mountStrategySeat({ sessionSwitch: true, route: { id: "iot-full" } }, async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true, json: async () => ({}) };
+  });
+  let selects = seat.render(undefined);
+  selects[0].props.onChange({ target: { value: "off" } });
+  selects = seat.render(undefined);
+  selects.find((select) => select.props.title?.includes("教师开关")).props.onChange({ target: { value: "on" } });
+  assert.equal(seat.states[1].strategy, "off");
+  assert.equal(seat.states[1].teacher.enabled, true);
+  seat.render("new-session");
+  seat.effects[seat.effects.length - 1](); // sessionId 出现后落盘 pending
+  assert.equal(requests[0].strategy, "off");
+  assert.deepEqual(requests[0].teacher, { enabled: true });
+  selects = seat.render("new-session");
+  selects[0].props.onChange({ target: { value: "" } });
+  assert.equal(requests[1].strategy, null, "用户明确选择跟随默认仍可清除档位");
+});
+
+await check("预设冲突：defaultPreset 只在 custom 档位生效，别的档位静默忽略", () => {
+  const items = resolveConfig({ strategy: "iot-balanced", defaultPreset: "builtin:standard" }, { sessionId: "s" });
+  assert.equal(items.strategy, "iot-balanced");
+  assert.equal(items.limits.preset, undefined, "非 custom 档位不该装配预设");
+
+  const custom = resolveConfig({ strategy: "custom", defaultPreset: "builtin:standard" }, { sessionId: "s" });
+  assert.equal(custom.limits.preset.kind, "builtin");
+
+  // 会话覆盖压过全局默认预设。
+  const session = resolveConfig(
+    { strategy: "custom", defaultPreset: "builtin:standard", sessions: { s: { strategy: "custom", preset: "builtin:deep" } } },
+    { sessionId: "s" },
+  );
+  assert.equal(session.limits.preset.name, "deep");
+});
+
+await check("预设冲突：目录文件与内置预设同名时互不干扰", () => {
+  const file = resolveConfig({ strategy: "custom", sessions: { s: "custom:standard" } }, { sessionId: "s" });
+  assert.equal(file.limits.preset.name, "standard");
+  assert.equal(file.limits.preset.kind, undefined, "custom:standard 是文件，不是内置");
+  const builtin = resolveConfig({ strategy: "custom", sessions: { s: "builtin:standard" } }, { sessionId: "s" });
+  assert.equal(builtin.limits.preset.kind, "builtin");
+});
+
+await check("内置预设：两个模板都在、只读、且要求必须更短", () => {
+  const ids = BUILTIN_PRESETS.map((preset) => preset.id);
+  assert.deepEqual(ids, ["standard", "deep"]);
+  for (const preset of BUILTIN_PRESETS) {
+    assert.equal(preset.accept, "shorter", `${preset.id} 必须要求更短，否则会拿更长的输出替换原文`);
+    assert.ok(preset.text.includes("{{draft}}"), `${preset.id} 必须带 draft 槽位`);
+    assert.ok(preset.text.length > 200);
+    assert.ok(Number.isFinite(preset.minChars) && preset.minChars >= 400);
+    assert.equal(builtinPresetById(preset.id).id, preset.id);
+    assert.equal(builtinPresetById(`builtin:${preset.id}`).id, preset.id);
+  }
+  assert.equal(builtinPresetById("nope"), null);
+  const catalog = builtinPresetCatalog();
+  assert.deepEqual(catalog.map((entry) => entry.value), ["builtin:standard", "builtin:deep"]);
+});
+
+await check("内置预设：custom 档位按 builtin 装配提示词，accept 由预设决定", () => {
+  const resolved = resolveConfig({ strategy: "custom", defaultPreset: "builtin:standard" }, { sessionId: "s" });
+  assert.equal(resolved.limits.preset.kind, "builtin");
+  assert.equal(resolved.limits.preset.name, "standard");
+  assert.equal(resolved.limits.acceptRule, "shorter", "内置预设必须强制 shorter");
+  const strategy = strategyById("custom");
+  const prepared = strategy.prepare(resolved.limits);
+  assert.equal(prepared.error, null);
+  assert.ok(prepared.state.text.includes("【决定】"));
+  const prompt = strategy.buildPrompt("草稿", { strict: false, reason: null, detail: null, state: prepared.state });
+  assert.ok(prompt.includes("草稿"));
+  assert.ok(prompt.includes("【计划】"));
+
+  // 会话覆盖优先于全局默认预设。
+  const session = resolveConfig(
+    { strategy: "custom", defaultPreset: "builtin:standard", sessions: { "s": { strategy: "custom", preset: "builtin:deep" } } },
+    { sessionId: "s" },
+  );
+  assert.equal(session.limits.preset.name, "deep");
+});
+
+await check("内置预设：目录文件与内置预设互不冲突，未知内置名报错而不是静默", () => {
+  const unknown = resolveConfig({ strategy: "custom", defaultPreset: "builtin:nope" }, { sessionId: "s" });
+  assert.equal(unknown.limits.preset.kind, "builtin");
+  const prepared = strategyById("custom").prepare(unknown.limits);
+  assert.equal(prepared.error, "没有这个内置预设：nope");
+  assert.equal(prepared.state, null);
+});
+
+await check("会话覆盖：对象形态 {strategy,preset} 能解析，旧字符串形态仍读得懂", () => {
+  const objectForm = resolveRoute({ sessions: { s1: { strategy: "custom", preset: "builtin:deep" } } }, { sessionId: "s1" });
+  assert.deepEqual(objectForm, { id: "custom", builtin: "deep", source: "session", key: "s1" });
+  const stringForm = resolveRoute({ sessions: { s1: "custom:my-style" } }, { sessionId: "s1" });
+  assert.deepEqual(stringForm, { id: "custom", custom: "my-style", source: "session", key: "s1" });
+  const plainForm = resolveRoute({ sessions: { s1: "iot-compact" } }, { sessionId: "s1" });
+  assert.deepEqual(plainForm, { id: "iot-compact", source: "session", key: "s1" });
+});
+
+await check("内置预设：真改写走 custom 档位，提示词里带预设正文", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([{ type: "text-delta", index: 0, text: GOOD }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const result = await compressWith(ctx, {
+    cfg: { strategy: "custom", limits: { ...limitsOf("custom"), preset: { kind: "builtin", name: "standard" }, acceptRule: "shorter" } },
+    events,
+    text: DRAFT.repeat(3),
+  });
+  assert.equal(result?.text, GOOD);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].messages[0].content[0].text.includes("【决定】"), "内置预设正文要进提示词");
+  assert.equal(result.event.strategy, "custom", "记账要写实际档位");
+});
+
+await check("内置预设：比原文长的输出不被接受（shorter 规则）", async () => {
+  const long = GOOD.repeat(20);
+  const ctx = {
+    llm: {
+      stream: () => chunks([{ type: "text-delta", index: 0, text: long }, { type: "finish", reason: { kind: "stop" } }]),
+    },
+  };
+  const result = await compressWith(ctx, {
+    cfg: { strategy: "custom", limits: { ...limitsOf("custom"), preset: { kind: "builtin", name: "standard" }, acceptRule: "shorter" } },
+    text: DRAFT.repeat(3),
+  });
+  assert.equal(result, null, "更长的输出必须保留原文");
+});
+
+await check("改写器路由迁移：旧顶层字段搬进 rewrite，旧键删掉", () => {
+  const migrated = migrateRewriteConfig({ enabled: true, provider: "old-p", model: "old-m", reasoningEffort: "high" });
+  assert.deepEqual(migrated.rewrite, { provider: "old-p", model: "old-m", effort: "high" });
+  for (const key of ["provider", "model", "reasoningEffort"]) {
+    assert.equal(migrated[key], undefined, `迁移后不该还留着 ${key}`);
+  }
+  const fresh = { rewrite: { provider: "p", model: "m", effort: "auto", fallback: "session" } };
+  assert.equal(migrateRewriteConfig(fresh), fresh, "已经是新形状就不动");
+});
+
+await check("配置存储：rewrite 块只收已知键，非法 fallback 落回 keep，且是深合并", () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-rewrite-"));
+  const store = new ConfigStore(join(dir, "config.json"));
+  store.save({ rewrite: { provider: " local-p ", model: "small", effort: "high", fallback: "nonsense" } });
+  const first = store.load();
+  assert.equal(first.rewrite.provider, "local-p", "provider 要 trim");
+  assert.equal(first.rewrite.model, "small");
+  assert.equal(first.rewrite.effort, "high");
+  assert.equal(first.rewrite.fallback, "keep", "非法 fallback 不该落盘");
+
+  store.save({ rewrite: { model: "other" } });
+  const second = store.load();
+  assert.equal(second.rewrite.provider, "local-p", "只改 model 时 provider 必须保留");
+  assert.equal(second.rewrite.model, "other");
+});
+
+await check("一键测试：选预设时真的测那份预设，不静默回落到全局档位", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-test-preset-")), "config.json"));
+  store.save({ strategy: "iot-full", rewrite: { provider: "p", model: "m" }, defaultPreset: "builtin:standard" });
+  const seen = [];
+  registerConfigApi(testCtx(ws), store, {
+    rewrite: async (text, options, cfg) => {
+      seen.push({ strategy: cfg.strategy, preset: cfg.limits?.preset?.name ?? cfg.limits?.preset?.kind ?? null, inject: cfg.inject ?? null });
+      return { text: "[决定] 甲。", event: { strategy: cfg.strategy, finish: "stop" } };
+    },
+    getRoute: () => ({ provider: "p", model: "m" }),
+  });
+
+  const res = await ws.call("/iot-thinking/api/test", {
+    method: "POST",
+    body: JSON.stringify({ strategy: { strategy: "custom", preset: "builtin:standard" }, text: DRAFT.repeat(3) }),
+  });
+  assert.equal(res.statusCode, 200);
+  // 迁移后执行档位是完整档；真正区分"测了哪份预设"的是注入值，不是档位名。
+  assert.equal(seen[0].strategy, "iot-full", "迁移后的执行档位");
+  assert.equal(seen[0].preset, "standard", "要带上内置预设名");
+  assert.equal(seen[0].inject, "builtin:standard", "注入要指向这份预设");
+});
+
+await check("策略原文接口：自定义预设带文件名时不 500", async () => {
+  const ws = fakeWebServer();
+  const dir = mkdtempSync(join(tmpdir(), "iot-preset-dir-"));
+  writeFileSync(join(dir, "mine.md"), "先确认事实，再给结论。", "utf8");
+  const store = new ConfigStore(join(dir, "config.json"));
+  store.save({ presetDir: dir });
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const res = await ws.call("/iot-thinking/api/strategy", { url: "/iot-thinking/api/strategy?id=custom&preset=mine.md" });
+  assert.equal(res.statusCode, 200, "不能 500：" + JSON.stringify(res.payload));
+  assert.ok(String(res.payload.prompt ?? res.payload.text ?? "").includes("先确认事实"), "要带上预设正文：" + JSON.stringify(res.payload));
+});
+
+await check("内置建议不占节点预算：iot-full + builtin 模式下建议不被截掉", () => {
+  const strategy = strategyById("iot-full");
+  const raw = [
+    "[决定] 先把替换闸门的判定顺序写成测试。",
+    "[反对] 不要在每个块结束路径上做同步等待。",
+    "[计划] 再改设置卡里的档位选择与提示词。",
+    "[旁观者建议] 先补一个替换闸门的测试，再动 UI。",
+  ].join("\n\n");
+  const verdict = strategy.finalize(raw, {
+    original: Array.from({ length: 40 }, (_, i) => "第" + i + "句草稿，内容各不相同。").join(""),
+    limits: { maxNodes: 2, maxNeutral: 0 },
+    allowAdvice: true,
+  });
+  assert.equal(verdict.ok, true, "finalize 失败原因：" + JSON.stringify(verdict.reason ?? verdict));
+  assert.ok(verdict.text.includes("[旁观者建议] 先补一个替换闸门的测试，再动 UI。"), "建议节点必须留下");
+  // 不计入预算：压缩节点被截到 2 条，建议仍在。
+  assert.equal(verdict.text.split("\n\n").length, 3);
+});
+
+await check("会话建议覆盖穿过保存与归一化：不因保存档位而被抹掉", async () => {
+  const ws = fakeWebServer();
+  const dir = mkdtempSync(join(tmpdir(), "iot-session-keep-"));
+  const store = new ConfigStore(join(dir, "config.json"));
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  // 卡片保存：sessions 表里带 guidance 的对象形态。
+  const put = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({
+      sessions: {
+        "s-keep": { strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } },
+        "s-only": { guidance: { enabled: false } },
+      },
+    }),
+  });
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(put.payload.config.sessions["s-keep"], { strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } });
+  assert.deepEqual(put.payload.config.sessions["s-only"], { guidance: { enabled: false } }, "只含 guidance 的条目不能丢");
+
+  // 重读磁盘：必须还在（之前会在这里消失）。
+  const reloaded = store.load();
+  assert.deepEqual(reloaded.sessions["s-keep"].guidance, { enabled: true, mode: "builtin" });
+  assert.deepEqual(reloaded.sessions["s-only"], { guidance: { enabled: false } });
+});
+
+await check("session API：只传 guidance 时保留档位，不报 400", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-guidance-only-")), "config.json"));
+  store.save({ sessions: { s1: { strategy: "iot-full" } } });
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const res = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s1", guidance: { enabled: true, mode: "builtin" } }),
+  });
+  assert.equal(res.statusCode, 200, "只改建议不该 400：" + JSON.stringify(res.payload));
+  assert.deepEqual(res.payload.override, { strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } }, "档位必须保留");
+
+  const empty = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s1" }),
+  });
+  assert.equal(empty.statusCode, 400, "两个字段都不给要报错");
+});
+
+await check("旧配置迁移：只有 advisor.enabled 的旧文件，升级后外部建议要真的开着", () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-legacy-advisor-"));
+  const file = join(dir, "config.json");
+  writeFileSync(file, JSON.stringify({ strategy: "iot-full", advisor: { enabled: true, route: { provider: "strong", model: "s" } } }), "utf8");
+  const store = new ConfigStore(file);
+  const cfg = store.load();
+  assert.equal(cfg.guidance.enabled, true, "旧 advisor.enabled 必须折进 guidance.enabled");
+  assert.equal(cfg.guidance.mode, "external");
+  // 再存一次不能把它翻回去。
+  store.save({ strategy: "iot-full" });
+  assert.equal(store.load().guidance.enabled, true, "保存后仍要开着");
+});
+
+await check("旧档位别名：iot-guided 折叠成 iot-full + 内置建议，显式配置优先", () => {
+  const guided = resolveConfig({ strategy: "iot-guided" }, { sessionId: "s" });
+  assert.equal(guided.strategy, "iot-full", "旧档位折叠成完整档");
+  assert.deepEqual(guided.guidance, { enabled: true, mode: "builtin" }, "隐含的内置建议要带上来");
+  // 显式关掉时以用户为准，别名不能覆盖它。
+  const off = resolveConfig({ strategy: "iot-guided", guidance: { enabled: false, mode: "external" } }, { sessionId: "s" });
+  assert.equal(off.guidance.enabled, false, "显式关闭要生效");
+  // 会话覆盖里写了旧档位：同样折叠，且只影响该会话。
+  const session = resolveConfig({ strategy: "iot-full", sessions: { s: "iot-guided" } }, { sessionId: "s" });
+  assert.equal(session.strategy, "iot-full");
+  assert.deepEqual(session.guidance, { enabled: true, mode: "builtin" });
+  const other = resolveConfig({ strategy: "iot-full", sessions: { s: "iot-guided" } }, { sessionId: "s2" });
+  assert.equal(other.guidance.enabled, false, "别的会话不受影响");
+});
+
+await check("/iot 切换档位保留会话建议覆盖，/iot auto 也不清建议", () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-switch-guidance-"));
+  const store = new ConfigStore(join(dir, "config.json"));
+  store.save({ sessions: { s1: { strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } } } });
+
+  const switched = switchSessionStrategy({ store, sessionId: "s1", rawInput: "iot-balanced" });
+  assert.equal(switched.kind, "success");
+  const afterSwitch = store.load().sessions["s1"];
+  assert.equal(afterSwitch.strategy, "iot-balanced");
+  assert.deepEqual(afterSwitch.guidance, { enabled: true, mode: "builtin" }, "换档位不能抹掉建议");
+
+  const cleared = switchSessionStrategy({ store, sessionId: "s1", rawInput: "auto" });
+  assert.equal(cleared.kind, "success");
+  assert.deepEqual(store.load().sessions["s1"], { guidance: { enabled: true, mode: "builtin" } }, "auto 只清档位");
+});
+
+await check("建议调用超时必须返回：适配器不响应 abort 也不能把块挂死", async () => {
+  const events = [];
+  // 这个流永远不结束，也不理 abort —— 正是"任务卡住"的成因。
+  const ctx = { llm: { stream: () => (async function* () { await new Promise(() => {}); })() } };
+  const started = Date.now();
+  const raw = await advise({
+    ctx,
+    Llm: { BlockAssembler: class { push() {} blocks() { return []; } get finish() { return undefined; } }, createUserMessage: strictCreateUserMessage },
+    route: { provider: "p", model: "m" },
+    prompt: "x",
+    options: {},
+    timeoutMs: 200,
+    onEvent: (event, fields) => events.push({ event, ...fields }),
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(raw, null, "超时要返回 null，不能一直挂着");
+  assert.ok(elapsed < 1000, "应在超时附近返回（实际 " + elapsed + "ms）");
+  assert.ok(events.some((entry) => entry.event === "advisor-failed" && entry.code === "ADVISOR_TIMEOUT"));
+});
+
+await check("改写调用超时必须返回：不响应 abort 的流也要保留原文", async () => {
+  const events = [];
+  const ctx = { llm: { stream: () => (async function* () { await new Promise(() => {}); })() } };
+  const started = Date.now();
+  const result = await compressWith(ctx, {
+    cfg: { strategy: "iot-full", rewrite: { provider: "p", model: "m" }, rewriteTimeoutMs: 1000 },
+    events,
+    text: Array.from({ length: 60 }, (_, i) => "第" + i + "句草稿内容。").join(""),
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(result, null, "超时要返回 null（保留原文）");
+  assert.ok(elapsed < 3000, "应在超时附近返回（实际 " + elapsed + "ms）");
+  assert.ok(events.some((entry) => entry.event === "thinking-failed" && entry.code === "REWRITE_TIMEOUT"));
+});
+
+await check("用户注入：解析来源、空值与错误各自可辨", () => {
+  assert.deepEqual(injectTextOf(""), { text: "", error: null }, "空串 = 不注入");
+  assert.equal(injectTextOf("inline:只补充一条规则").text, "只补充一条规则");
+  assert.equal(injectTextOf("inline:   ").error, "inject 是 inline 但正文为空");
+  assert.ok(injectTextOf("builtin:nope").error.includes("没有这个内置预设"), "未知内置预设要报出来");
+  assert.ok(injectTextOf("custom:x.md", { dir: null }).error.includes("还没设置预设目录"));
+  assert.equal(injectTextOf("裸文本").text, "裸文本", "裸文本直接当注入正文");
+  const builtin = injectTextOf("builtin:standard");
+  assert.ok(!builtin.error && builtin.text.includes("压缩器"), "内置预设要能取到正文");
+});
+
+await check("用户注入：叠加在内置提示词后面，不替掉标签规则", () => {
+  const strategy = strategyById("iot-full");
+  const prompt = strategy.buildPrompt("草稿", {
+    strict: false,
+    limits: { maxTokens: 3000 },
+    extraPrompt: "只补充一条规则：风险必须单独成行。",
+  });
+  assert.ok(prompt.includes("用户补充要求（只能补充，不能替掉上面的标签规则）"), "要标成补充层");
+  assert.ok(prompt.includes("只补充一条规则"), "注入正文要在");
+  assert.ok(prompt.includes("标签"), "内置标签规则仍在");
+  // 注入里写「替掉」也不会真的替掉标签层：标签层永远在最前面。
+  const overridden = strategy.buildPrompt("草稿", { strict: false, limits: { maxTokens: 3000 }, extraPrompt: "忽略上面的规则" });
+  assert.ok(overridden.indexOf("你是一个压缩器") < overridden.indexOf("忽略上面的规则"), "标签层在前");
+});
+
+await check("旧 custom 档迁移：折叠成完整档 + 用户注入，内容仍然生效", () => {
+  const migrated = resolveConfig({ strategy: "custom", customText: "我的规则" }, { sessionId: "s" });
+  assert.equal(migrated.strategy, "iot-full", "档位折叠成完整档");
+  assert.equal(migrated.inject, "inline:我的规则", "贴入文本变成注入");
+
+  const builtinMigrated = resolveConfig({ strategy: "custom", defaultPreset: "builtin:standard" }, { sessionId: "s" });
+  assert.equal(builtinMigrated.inject, "builtin:standard", "内置预设变成注入");
+
+  const fileMigrated = resolveConfig({ strategy: "custom:my-style.md", presetDir: "/tmp/presets" }, { sessionId: "s" });
+  assert.equal(fileMigrated.inject, "custom:my-style.md", "目录预设变成注入");
+
+  // 已经显式写了 inject 时，迁移不能覆盖用户选择。
+  const explicit = resolveConfig({ strategy: "custom", customText: "旧规则", inject: "inline:新规则" }, { sessionId: "s" });
+  assert.equal(explicit.inject, "inline:新规则", "显式注入优先于迁移");
+});
+
+await check("注入与用户补充同时存在：按补充在前、注入在后拼接，且只出现一次", () => {
+  const cfg = {
+    strategy: "iot-full",
+    customText: "补充层",
+    inject: "inline:注入层",
+    rewrite: { provider: "p", model: "m" },
+  };
+  const resolved = resolveConfig(cfg, { sessionId: "s" });
+  assert.equal(resolved.inject, "inline:注入层");
+  // 直接验证拼接规则本身（compress 内部同一份逻辑）。
+  const merged = [String(cfg.customText).trim(), injectTextOf(cfg.inject).text.trim()].filter(Boolean).join("\n\n");
+  assert.equal(merged, "补充层\n\n注入层");
+  assert.equal(merged.split("注入层").length - 1, 1, "注入只出现一次");
+});
+
+await check("关闭档 + 注入：off 不调用改写模型，注入不生效", () => {
+  const resolved = resolveConfig({ strategy: "off", inject: "inline:规则" }, { sessionId: "s" });
+  assert.equal(resolved.strategy, "off");
+  assert.equal(resolved.inject, "inline:规则", "值仍保留，但 off 不构建提示词");
+  const strategy = strategyById("off");
+  assert.equal(strategy.buildPrompt("草稿", { extraPrompt: "inline:规则" }), "", "off 的提示词是空串");
+});
+
+await check("教师互斥：咨询过的那一轮不再触发外部建议", () => {
+  resetTeacherState();
+  const limits = { cooldownBlocks: 3 };
+  noteBlock("s1");
+  assert.equal(adviceMuted("s1"), false, "没咨询过时不互斥");
+  markConsulted("s1", limits);
+  assert.equal(adviceMuted("s1"), true, "咨询后同一轮互斥");
+  noteBlock("s1");
+  assert.equal(adviceMuted("s1"), true, "紧接着的下一块也互斥");
+  noteBlock("s1");
+  assert.equal(adviceMuted("s1"), false, "再往后恢复");
+  resetTeacherState();
+});
+
+await check("教师会话覆盖：全局没开时，会话可以单独打开", () => {
+  const global = resolveConfig({ strategy: "iot-full", advisor: { teacher: { enabled: false } } }, { sessionId: "s" });
+  assert.equal(global.teacher.enabled, false);
+
+  const on = resolveConfig({
+    strategy: "iot-full",
+    advisor: { teacher: { enabled: false, cooldownBlocks: 5 } },
+    sessions: { s: { teacher: { enabled: true } } },
+  }, { sessionId: "s" });
+  assert.equal(on.teacher.enabled, true, "会话能覆盖全局开关");
+  assert.equal(on.teacher.cooldownBlocks, 5, "参数仍走全局，不被会话复制");
+
+  const off = resolveConfig({
+    strategy: "iot-full",
+    advisor: { teacher: { enabled: true } },
+    sessions: { s: { teacher: { enabled: false } } },
+  }, { sessionId: "s" });
+  assert.equal(off.teacher.enabled, false, "会话也能关掉全局开启");
+
+  const follow = resolveConfig({
+    strategy: "iot-full",
+    advisor: { teacher: { enabled: true } },
+    sessions: { s: { teacher: null } },
+  }, { sessionId: "s" });
+  assert.equal(follow.teacher.enabled, true, "null 跟随全局");
+});
+
+await check("session API：教师开关与档位分开落盘，只改教师不清档位", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-session-teacher-")), "config.json"));
+  store.save({ sessions: { s1: { strategy: "iot-full" } } });
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const on = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s1", teacher: { enabled: true } }),
+  });
+  assert.equal(on.statusCode, 200, "只改教师不该报错：" + JSON.stringify(on.payload));
+  assert.deepEqual(on.payload.override, { strategy: "iot-full", teacher: { enabled: true } }, "档位必须保留");
+
+  const get = await ws.call("/iot-thinking/api/session", { url: "/iot-thinking/api/session?sessionId=s1" });
+  assert.equal(get.payload.teacher.global, false);
+  assert.equal(get.payload.teacher.effective, true, "会话开关要生效");
+
+  // 显式 null：回到跟随全局。
+  const reset = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s1", teacher: null }),
+  });
+  assert.deepEqual(reset.payload.override, { strategy: "iot-full" }, "清教师覆盖但保留档位");
+});
+
+await check("教师咨询预约是会话内原子的，失败释放且 dispose 可清理", () => {
+  resetTeacherState();
+  const first = reserveConsult("race");
+  assert.ok(first, "第一次预约成功");
+  assert.equal(reserveConsult("race"), null, "同会话并发预约必须拒绝");
+  assert.equal(canConsult("race"), false);
+  releaseConsult("race", first);
+  assert.equal(canConsult("race"), true, "失败释放后立即恢复");
+  const second = reserveConsult("race");
+  markConsulted("race", { cooldownBlocks: 3 }, second);
+  assert.equal(teacherStatus("race").calls, 1);
+  clearTeacherState("race");
+  assert.deepEqual(teacherStatus("race"), { available: true, remainingBlocks: 0, calls: 0 });
+  resetTeacherState();
+});
+
+await check("教师上下文同轮多个 assistant 只取最终正文", () => {
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "需求" }] },
+    { role: "assistant", content: [{ type: "text", text: "中间结果" }] },
+    { role: "assistant", content: [{ type: "text", text: "最终正文" }] },
+  ];
+  const session = { log: messages, surface: { deriveEventMessage: (event) => event } };
+  assert.deepEqual(extractSessionContext(session, 1), [{ user: "需求", assistant: "最终正文" }]);
+});
+
+await check("教师冷却：调用后进入 CD，按块递减，冷却中拒绝调用", () => {
+  resetTeacherState();
+  const limits = { cooldownBlocks: 3, minDepth: 1, maxDepth: 5 };
+  assert.equal(canConsult("s1"), true, "初始可用");
+  noteBlock("s1");
+  noteBlock("s1");
+  markConsulted("s1", limits);
+  assert.equal(canConsult("s1"), false, "调用后冷却");
+  assert.equal(teacherStatus("s1", limits).remainingBlocks, 3);
+  noteBlock("s1");
+  assert.equal(teacherStatus("s1", limits).remainingBlocks, 2, "块推进要递减");
+  noteBlock("s1");
+  noteBlock("s1");
+  assert.equal(canConsult("s1"), true, "冷却结束恢复可用");
+  // 会话隔离：另一个会话不受影响。
+  assert.equal(canConsult("s2"), true);
+  resetTeacherState();
+});
+
+await check("教师配置归一化：depthRange 转成 minDepth/maxDepth，状态行不再显示 undefined", () => {
+  const limits = normalizeTeacherLimits({ enabled: true, depthRange: [2, 4], cooldownBlocks: 5 });
+  assert.equal(limits.minDepth, 2);
+  assert.equal(limits.maxDepth, 4);
+  assert.equal(limits.cooldownBlocks, 5);
+  const line = formatTeacherStatus(teacherStatus("cfg-1", limits), limits);
+  assert.ok(line.includes("深度 2-4"), "要显示真实范围：" + line);
+  assert.ok(!line.includes("undefined"), "不能出现 undefined");
+  // 缺配置时落回默认，而不是 undefined。
+  const fallback = normalizeTeacherLimits({});
+  assert.equal(fallback.minDepth, 1);
+  assert.equal(fallback.maxDepth, 5);
+  // 反序输入要被纠正。
+  const reversed = normalizeTeacherLimits({ depthRange: [4, 2] });
+  assert.equal(reversed.minDepth, 2);
+  assert.equal(reversed.maxDepth, 4);
+  resetTeacherState();
+});
+
+await check("教师状态行：只显示可用/冷却，不显示总额", () => {
+  resetTeacherState();
+  const limits = { cooldownBlocks: 2, minDepth: 1, maxDepth: 5 };
+  const available = formatTeacherStatus(teacherStatus("s1", limits), limits);
+  assert.ok(available.includes("可用"), "初始要显示可用");
+  assert.ok(available.includes("深度 1-5"), "要说明深度范围");
+  markConsulted("s1", limits);
+  const cooling = formatTeacherStatus(teacherStatus("s1", limits), limits);
+  assert.ok(cooling.includes("冷却中"), "调用后显示冷却");
+  assert.ok(cooling.includes("2"), "要显示剩余块数");
+  assert.ok(!cooling.includes("次"), "不该暴露总次数");
+  resetTeacherState();
+});
+
+await check("教师提示词：骨架固定、ask 决定输出结构、上下文按顺序组装", () => {
+  const prompt = buildTeacherPrompt({
+    goal: "把登录改成 OAuth",
+    progress: "已完成回调，卡在 token 刷新",
+    rounds: [{ user: "把登录改成 OAuth", assistant: "[决定] 用授权码模式。" }],
+    draft: "[待定] 刷新令牌要不要轮换？",
+    ask: "plan",
+    limits: { inputBudget: 12000 },
+  });
+  assert.ok(prompt.includes("你是一位资深工程师"), "系统提示词骨架要在");
+  assert.ok(prompt.includes("## 当前需求"), "需求段要在");
+  assert.ok(prompt.includes("## 最近轮次"), "轮次段要在");
+  assert.ok(prompt.includes("## 本次要你做什么"), "任务段要在");
+  assert.ok(prompt.includes("简短方案"), "plan 模板要生效");
+  assert.ok(!prompt.includes("1~3 条**可执行**建议"), "不该混入 advice 模板");
+  // ask 非法时回落到 advice。
+  const fallback = buildTeacherPrompt({ goal: "x", ask: "nonsense" });
+  assert.ok(fallback.includes("1~3 条**可执行**建议"), "非法 ask 回落到 advice");
+  assert.equal(ASK_KINDS.length, 5);
+});
+
+await check("教师上下文抽取：只取正文，按轮聚合，depth 限制轮数", () => {
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "第一个需求" }] },
+    { role: "assistant", content: [{ type: "text", text: "[决定] 先做 A。" }] },
+    { role: "user", content: [{ type: "text", text: "第二个需求" }] },
+    { role: "assistant", content: [{ type: "text", text: "[决定] 先做 B。" }] },
+    { role: "user", content: [{ type: "text", text: "继续" }] },
+  ];
+  const fakeSession = {
+    log: messages.map((_, index) => ({ seq: index })),
+    surface: { deriveEventMessage: (event) => messages[event.seq] },
+  };
+  const one = extractSessionContext(fakeSession, 1);
+  assert.equal(one.length, 1, "depth=1 只要一轮");
+  assert.equal(one[0].user, "继续", "取最近的一轮");
+  const all = extractSessionContext(fakeSession, 5);
+  assert.equal(all.length, 3, "最多三轮用户消息");
+  assert.equal(all[0].user, "第一个需求", "顺序要按时间正序");
+  assert.ok(all[0].assistant.includes("先做 A"), "助手结论要带上");
+  assert.deepEqual(extractSessionContext(null, 3), [], "拿不到会话要返回空");
+});
+
+await check("教师咨询超时必返回：不响应 abort 的流不能挂死", async () => {
+  const ctx = { llm: { stream: () => (async function* () { await new Promise(() => {}); })() } };
+  const started = Date.now();
+  const result = await consultTeacher({
+    ctx,
+    Llm: { BlockAssembler: class { push() {} blocks() { return []; } get finish() { return undefined; } }, createUserMessage: strictCreateUserMessage },
+    route: { provider: "p", model: "m" },
+    prompt: "x",
+    options: {},
+    timeoutMs: 200,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "TEACHER_TIMEOUT");
+  assert.ok(Date.now() - started < 1000, "要按时返回");
+});
+
+await check("失败消息可读：对象形态的失败载荷不能变成 [object Object]", () => {
+  assert.equal(describeError({ message: "content is not iterable", code: "UNKNOWN" }), "content is not iterable");
+  assert.equal(describeError({ error: "boom" }), "boom");
+  assert.ok(describeError({ code: -4003, param: "temperature" }).includes("temperature"), "没有 message 时要序列化");
+  assert.equal(describeError("plain"), "plain");
+  assert.equal(describeError(new Error("real error")), "real error");
+  assert.ok(!describeError({ message: { nested: true } }).includes("[object Object]"), "嵌套对象也不能是 [object Object]");
+  assert.equal(errorCodeOf({ code: "INVALID_REQUEST" }), "INVALID_REQUEST");
+});
+
+await check("指导消息形态：必须与压缩调用一致（对象 + content 数组）", async () => {
+  const seen = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        seen.push(options.messages[0]);
+        const text = options.model === "strong" ? "[旁观者建议] 先补测试。" : "[决定] 先做替换闸门。";
+        return chunks([{ type: "text-delta", index: 0, text }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const cfg = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { route: { provider: "strong", model: "strong" } },
+    guidance: { enabled: true, mode: "external" },
+  };
+  const result = await compressWith(ctx, { cfg, text: DRAFT.repeat(2) });
+  assert.ok(result.advice, "外部建议要产出");
+  const advisorCall = seen.find((message) => message && message.role === "user" && Array.isArray(message.content));
+  assert.ok(advisorCall, "指导调用必须给 createUserMessage 一个对象形态的消息");
+  assert.equal(advisorCall.content[0].type, "text");
+});
+
+await check("debugChunks 能落盘：不在 DEFAULTS 之外的键不该被静默丢弃", () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-debug-chunks-"));
+  const store = new ConfigStore(join(dir, "config.json"));
+  store.save({ debugChunks: false });
+  assert.equal(store.load().debugChunks, false, "debugChunks=false 必须保留");
+});
+
+await check("数字字段清空：null 落盘为默认值，不是被忽略", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-null-num-")), "config.json"));
+  store.save({ rewriteTimeoutMs: 60000, rewriteBudget: 6, maxChars: 20000 });
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const res = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ rewriteTimeoutMs: null, rewriteBudget: null, maxChars: null }),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload.config.rewriteTimeoutMs, DEFAULTS.rewriteTimeoutMs, "清空要回默认");
+  assert.equal(res.payload.config.rewriteBudget, DEFAULTS.rewriteBudget);
+  assert.equal(res.payload.config.maxChars, DEFAULTS.maxChars);
+});
+
+await check("effort 缓存按角色隔离：建议链的探测不影响改写链", () => {
+  resetEffortPlans();
+  rememberEffortPlan(planKey("p", "m", "auto", "advisor"), null);
+  assert.equal(knownEffortPlan(planKey("p", "m", "auto", "rewrite")), undefined, "改写链不该读到建议链的结论");
+  assert.equal(knownEffortPlan(planKey("p", "m", "auto", "advisor")), null);
+  resetEffortPlans();
+});
+
+await check("noThink 跨档位：三档基础模式的提示词也要禁止输出思考标记", () => {
+  const cfg = resolveConfig({ strategy: "iot-full" }, { sessionId: "s" });
+  assert.equal(cfg.limits.noThink, true, "noThink 默认要开");
+  const prompt = strategyById("iot-full").buildPrompt(DRAFT, { strict: false, reason: null, detail: null, limits: cfg.limits });
+  assert.ok(prompt.includes("不要输出 `<thinking>`"), "提示词必须说清楚");
+});
+
+await check("预设大小按字节判定：中文大预设不会写完就从列表消失", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-preset-bytes-"));
+  const store = new ConfigStore(join(dir, "config.json"));
+  store.save({ presetDir: dir });
+  const ws = fakeWebServer();
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  // 汉字 3 字节：22000 字 ≈ 66KB，超过 64KB 上限，必须被拒绝（而不是写进去再消失）。
+  const big = "汉".repeat(22000);
+  const res = await ws.call("/iot-thinking/api/preset-dir", {
+    method: "POST",
+    body: JSON.stringify({ name: "big.md", text: big }),
+  });
+  assert.equal(res.statusCode, 400, "超字节上限要拒绝");
+});
+
+await check("压缩首轮失败时丢弃建议，晚到的建议不记 ready", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        if (options.model === "strong") {
+          return (async function* () {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            yield { type: "text-delta", index: 0, text: "[旁观者建议] 先补测试。" };
+            yield { type: "finish", reason: { kind: "stop" } };
+          })();
+        }
+        return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "boom", code: "E" } } }]);
+      },
+    },
+  };
+  const cfg = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { route: { provider: "strong", model: "strong" }, wait: true },
+    guidance: { enabled: true, mode: "external" },
+  };
+  const result = await compressWith(ctx, { cfg, events, text: DRAFT.repeat(2) });
+  assert.equal(result, null, "首轮失败要回原文");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(!events.some((entry) => entry.event === "advisor-ready"), "没被采用的建议不该记 ready");
+});
+
+await check("配置存储：advisor.wait/maxTokens 归一化，且增量保存不抹掉 route", () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-advisor-"));
+  const store = new ConfigStore(join(dir, "config.json"));
+  store.save({ advisor: { route: { provider: "strong", model: "s" }, wait: false, maxTokens: 5000 } });
+  const first = store.load();
+  assert.equal(first.advisor.wait, false);
+  assert.equal(first.advisor.maxTokens, 5000);
+  assert.equal(first.advisor.route.provider, "strong");
+
+  // 只改开关：route 与预算必须保留。
+  store.save({ advisor: { wait: true } });
+  const second = store.load();
+  assert.equal(second.advisor.wait, true);
+  assert.equal(second.advisor.route.model, "s", "增量保存不能抹掉 route");
+  assert.equal(second.advisor.maxTokens, 5000, "增量保存不能抹掉 maxTokens");
+
+  // 非法值落回默认：wait 只认布尔，maxTokens 有上下限。
+  store.save({ advisor: { wait: "yes", maxTokens: 99999 } });
+  const third = store.load();
+  assert.equal(third.advisor.wait, true, "非布尔值不该落盘");
+  assert.equal(third.advisor.maxTokens, 8000, "上限 8000");
+});
+
+await check("配置 API：advisor.wait 与 maxTokens 只收合法值", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-api-wait-")), "config.json"));
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const res = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ advisor: { wait: false, maxTokens: 1500 } }),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload.config.advisor.wait, false);
+  assert.equal(res.payload.config.advisor.maxTokens, 1500);
+
+  const bad = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ advisor: { wait: "no", maxTokens: "big" } }),
+  });
+  assert.equal(bad.statusCode, 200);
+  assert.equal(bad.payload.config.advisor.wait, false, "非法 wait 保持原值");
+  assert.equal(bad.payload.config.advisor.maxTokens, 1500, "非法 maxTokens 保持原值");
+});
+
+await check("卸载：压缩调用真的发往配置的路由，并记账 offloaded", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([{ type: "text-delta", index: 0, text: GOOD }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { rewrite: { provider: "local-p", model: "small" } }, events });
+  assert.equal(result?.text, GOOD);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].provider, "local-p");
+  assert.equal(calls[0].model, "small");
+  const routeEvent = events.find((entry) => entry.event === "rewrite-route");
+  assert.equal(routeEvent.offloaded, true);
+  assert.equal(routeEvent.source, "config");
+  assert.equal(result.event.provider, "local-p", "记账要写实际用过的路由");
+  assert.equal(result.event.routeSource, "config");
+});
+
+await check("usage 记账：服务端 token 与可见正文分开记，含被丢弃的思考", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: () => chunks([
+        { type: "reasoning-delta", index: 0, text: "想了很久……" },
+        { type: "text-delta", index: 0, text: "[决定] 先这样。" },
+        { type: "finish", reason: { kind: "stop" } },
+        { type: "usage", usage: { prompt_tokens: 120, completion_tokens: 3400, reasoning_tokens: 3100 } },
+      ]),
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { rewriteBudget: 2 }, events, text: DRAFT.repeat(2) });
+  assert.ok(result && result.text.includes("[决定]"));
+  assert.deepEqual(result.event.usage, { promptTokens: 120, completionTokens: 3400, reasoningTokens: 3100, totalTokens: null });
+});
+
+await check("noThink：输出里出现 think 标签即判失败，且只重试一次", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([
+          { type: "text-delta", index: 0, text: "<thinking>我再想想</thinking>\n[决定] 先这样。" },
+          { type: "finish", reason: { kind: "stop" } },
+        ]);
+      },
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { noThink: true, rewriteBudget: 3 }, events, text: DRAFT.repeat(2) });
+  assert.equal(result, null, "两次都带 think 标签就保留原文");
+  assert.equal(calls.length, 2, "只重试一次");
+  assert.ok(events.some((entry) => entry.event === "thinking-think-tag" && entry.retried === false));
+  assert.ok(events.some((entry) => entry.event === "thinking-think-tag" && entry.retried === true));
+});
+
+await check("noThink 关闭：带 think 标签的输出照常接受", async () => {
+  const ctx = {
+    llm: {
+      stream: () => chunks([
+        { type: "text-delta", index: 0, text: "<thinking>想一下</thinking>\n[决定] 先这样。" },
+        { type: "finish", reason: { kind: "stop" } },
+      ]),
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { noThink: false, rewriteBudget: 2 }, text: DRAFT.repeat(2) });
+  assert.ok(result && result.text.includes("[决定]"));
+});
+
+await check("maxOut：超过字数预算判 over-budget，按原因重试一次而不是硬截断", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: () => chunks([
+        { type: "text-delta", index: 0, text: "【决定】" + "很长的结论".repeat(50) },
+        { type: "finish", reason: { kind: "stop" } },
+      ]),
+    },
+  };
+  const result = await compressWith(ctx, {
+    cfg: { strategy: "custom", rewriteBudget: 2, limits: { ...limitsOf("custom"), maxOut: 50, preset: { inline: "压短", name: "inline" }, acceptRule: "different" } },
+    events,
+    text: DRAFT.repeat(2),
+  });
+  assert.equal(result, null, "超预算两次就保留原文");
+  assert.ok(events.some((entry) => entry.event === "thinking-rejected" && entry.reason === "over-budget"));
+});
+
+await check("截断：max-tokens 直接停止，不再降级重试", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([{ type: "finish", reason: { kind: "max-tokens" } }]);
+      },
+    },
+  };
+  await compressWith(ctx, { cfg: { rewriteBudget: 4 }, events });
+  assert.equal(calls.length, 1, "截断不该再打第二次");
+  assert.ok(events.some((entry) => entry.event === "thinking-truncated"));
+});
+
+await check("内置预设可编辑：覆盖文本优先，恢复默认后回到原文", () => {
+  const overrides = { standard: "我的压缩规则：只输出一行。" };
+  assert.equal(builtinPresetText("standard", overrides), "我的压缩规则：只输出一行。");
+  assert.ok(builtinPresetText("standard", {}).includes("【决定】"), "没覆盖就用默认正文");
+  const resolved = resolveConfig({ strategy: "custom", defaultPreset: "builtin:standard", builtinOverrides: overrides }, { sessionId: "s" });
+  const prepared = strategyById("custom").prepare(resolved.limits);
+  assert.equal(prepared.state.text, "我的压缩规则：只输出一行。");
+  assert.equal(prepared.state.edited, true);
+});
+
+await check("内置建议：压缩档 + 内置建议 = 同一次调用产出压缩节点与建议，建议不占预算", () => {
+  const strategy = strategyById("iot-full");
+  assert.ok(strategy, "完整档必须存在");
+  const prompt = strategy.buildPrompt("草稿", { strict: false, limits: { maxTokens: 3000 }, allowAdvice: true });
+  assert.ok(prompt.includes("[旁观者建议]"), "开启内置建议后提示词必须说明写法");
+  assert.ok(prompt.includes("建议要求（本次开启）"), "开启后要有建议要求");
+  assert.ok(prompt.includes("不是命令"), "建议不是命令");
+  // 没开内置建议时提示词里不该出现建议要求。
+  const plain = strategy.buildPrompt("草稿", { strict: false, limits: { maxTokens: 3000 } });
+  assert.ok(!plain.includes("建议要求（本次开启）"), "关闭时不该要求输出建议");
+
+  const raw = "[决定] 先把替换闸门的判定顺序写成测试。\n\n[计划] 再改设置卡里的档位选择。\n\n[指导] 建议先补一个替换闸门的测试。";
+  const verdict = strategy.finalize(raw, {
+    original: Array.from({ length: 40 }, (_, i) => "第" + i + "句草稿，内容各不相同。").join(""),
+    limits: { maxNodes: 2, maxNeutral: 2 },
+    allowAdvice: true,
+  });
+  assert.equal(verdict.ok, true);
+  assert.ok(verdict.text.includes("[旁观者建议]"), "建议节点必须保留");
+  // maxNodes=2 只约束压缩节点；建议不参与截断。
+  assert.equal(verdict.text.split("\n\n").length, 3);
+});
+
+await check("内置建议与外部建议互斥：内置模式下不再打强模型", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = { llm: { stream: (options) => { calls.push(options.model); return chunks([{ type: "text-delta", index: 0, text: "[决定] 先把替换闸门的判定顺序写成测试。\n\n[指导] 建议先补一个替换闸门的测试。" }, { type: "finish", reason: { kind: "stop" } }]); } } };
+  const cfg = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { enabled: true, route: { provider: "strong", model: "strong" } },
+    guidance: { enabled: true, mode: "builtin" },
+  };
+  const result = await compressWith(ctx, { cfg, events, text: DRAFT.repeat(2) });
+  assert.equal(calls.length, 1, "指导档只调用压缩器，不再打强模型");
+  assert.ok(events.some((entry) => entry.event === "advisor-skipped" && entry.reason === "builtin-mode"));
+  assert.equal(result.advice ?? null, null);
+});
+
+await check("指导层：关闭时不调用，开启时调用强模型并给出可注入的建议", async () => {
+  const calls = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ provider: options.provider, model: options.model });
+        // 压缩调用走弱模型，指导调用走强模型。
+        const text = options.model === "strong"
+          ? "[旁观者建议] 下一步先把替换闸门的判定顺序写成测试，再动 UI。\n\n[指导] 别在块结束路径上做同步等待。"
+          : "[决定] 先做替换闸门。\n\n[计划] 补测试。";
+        return chunks([{ type: "text-delta", index: 0, text }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const cfg = {
+    strategy: "custom",
+    rewrite: { provider: "weak", model: "weak", fallback: "keep" },
+    advisor: { enabled: true, route: { provider: "strong", model: "strong" }, maxAdvice: 3, maxChars: 600 },
+    guidance: { enabled: true, mode: "external" },
+    limits: { ...limitsOf("custom"), preset: { inline: "压短", name: "inline" }, acceptRule: "different" },
+  };
+  const result = await compressWith(ctx, { cfg, text: DRAFT.repeat(2), options: { provider: "weak", model: "weak", sessionId: "s" } });
+  assert.ok(result, "压缩结果要保留");
+  assert.equal(result.text, "[决定] 先做替换闸门。\n\n[计划] 补测试。", "主体不含指导");
+  assert.ok(result.advice.includes("[旁观者建议]"), "指导单独返回");
+  assert.equal(calls.length, 2, "压缩一次 + 指导一次");
+  assert.ok(calls.some((call) => call.model === "strong"), "指导走配置的强模型");
+});
+
+await check("指导层：关闭时不多打一次模型", async () => {
+  const calls = [];
+  const ctx = { llm: { stream: (options) => { calls.push(options.model); return chunks([{ type: "text-delta", index: 0, text: "[决定] 甲。" }, { type: "finish", reason: { kind: "stop" } }]); } } };
+  const cfg = {
+    strategy: "custom",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { enabled: false },
+    guidance: { enabled: false, mode: "external" },
+    limits: { ...limitsOf("custom"), preset: { inline: "压短", name: "inline" }, acceptRule: "different" },
+  };
+  await compressWith(ctx, { cfg, text: DRAFT.repeat(2), options: { provider: "weak", model: "weak" } });
+  assert.equal(calls.length, 1);
+});
+
+await check("建议输出预算按 maxChars 推算，避免固定 800 截断", async () => {
+  const seen = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        if (options.model !== "strong") {
+          return chunks([{ type: "text-delta", index: 0, text: "[决定] 先做替换闸门。" }, { type: "finish", reason: { kind: "stop" } }]);
+        }
+        seen.push(options.maxTokens);
+        return chunks([{ type: "text-delta", index: 0, text: "[旁观者建议] 先补测试。" }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const base = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    guidance: { enabled: true, mode: "external" },
+  };
+  await compressWith(ctx, {
+    cfg: { ...base, advisor: { route: { provider: "strong", model: "strong" }, maxChars: 600 } },
+    text: DRAFT.repeat(2),
+  });
+  assert.equal(seen[0], 1200, "maxChars=600 应给 1200 token");
+
+  seen.length = 0;
+  await compressWith(ctx, {
+    cfg: { ...base, advisor: { route: { provider: "strong", model: "strong" }, maxChars: 600, maxTokens: 3000 } },
+    text: DRAFT.repeat(2),
+  });
+  assert.equal(seen[0], 3000, "显式 maxTokens 优先");
+});
+
+await check("可选建议：wait=false 时压缩不等指导，慢模型不拖流程", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        if (options.model !== "strong") {
+          return chunks([{ type: "text-delta", index: 0, text: "[决定] 先做替换闸门。\n\n[计划] 再补测试。" }, { type: "finish", reason: { kind: "stop" } }]);
+        }
+        // 指导模型很慢：压缩早就完成了。
+        return (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          yield { type: "text-delta", index: 0, text: "[旁观者建议] 先补测试。" };
+          yield { type: "finish", reason: { kind: "stop" } };
+        })();
+      },
+    },
+  };
+  const cfg = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { route: { provider: "strong", model: "strong" }, wait: false, maxAdvice: 3, maxChars: 600 },
+    guidance: { enabled: true, mode: "external" },
+  };
+  const started = Date.now();
+  const result = await compressWith(ctx, { cfg, events, text: DRAFT.repeat(2) });
+  const elapsed = Date.now() - started;
+  assert.ok(result && result.text.includes("[决定]"), "压缩结果照常返回");
+  assert.ok(!result.advice, "没赶上的建议要丢弃");
+  assert.ok(elapsed < 120, "不能等慢指导（实际 " + elapsed + "ms）");
+  assert.ok(events.some((entry) => entry.event === "advisor-skipped" && entry.reason === "not-ready"), "要记账 not-ready");
+  // 晚到的建议不能既记 ready 又记 skipped：同一块只允许一个结论。
+  await new Promise((resolve) => setTimeout(resolve, 160));
+  assert.ok(events.some((entry) => entry.event === "advisor-discarded"), "晚到的建议要记 discarded");
+  assert.ok(!events.some((entry) => entry.event === "advisor-ready"), "跳过之后不应再记 ready");
+});
+
+await check("可选建议：wait=true 时仍然等待并合并", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        if (options.model !== "strong") {
+          return chunks([{ type: "text-delta", index: 0, text: "[决定] 先做替换闸门。" }, { type: "finish", reason: { kind: "stop" } }]);
+        }
+        return (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          yield { type: "text-delta", index: 0, text: "[旁观者建议] 先补测试。" };
+          yield { type: "finish", reason: { kind: "stop" } };
+        })();
+      },
+    },
+  };
+  const cfg = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { route: { provider: "strong", model: "strong" }, wait: true, maxAdvice: 3, maxChars: 600 },
+    guidance: { enabled: true, mode: "external" },
+  };
+  const result = await compressWith(ctx, { cfg, events, text: DRAFT.repeat(2) });
+  assert.ok(result.advice && result.advice.includes("[旁观者建议]"), "要等并合并");
+  assert.ok(!events.some((entry) => entry.event === "advisor-skipped" && entry.reason === "not-ready"));
+});
+
+await check("指导层：调用失败不影响压缩结果", async () => {
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        if (options.model === "strong") {
+          return (async function* () { throw Object.assign(new Error("boom"), { code: "TRANSPORT" }); })();
+        }
+        return chunks([{ type: "text-delta", index: 0, text: "[决定] 甲。" }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const cfg = {
+    strategy: "custom",
+    rewrite: { provider: "weak", model: "weak" },
+    advisor: { enabled: true, route: { provider: "strong", model: "strong" } },
+    limits: { ...limitsOf("custom"), preset: { inline: "压短", name: "inline" }, acceptRule: "different" },
+  };
+  const result = await compressWith(ctx, { cfg, text: DRAFT.repeat(2) });
+  assert.equal(result.text, "[决定] 甲。", "指导失败时主体原样保留");
+  assert.equal(result.advice ?? null, null);
+});
+
+await check("temperature：模型只接受默认值时去掉字段重试，并记住这条路由", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push(options.temperature);
+        if (options.temperature !== undefined) {
+          return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "Unsupported value: 'temperature' does not support 0.2 with this model", code: "INVALID_REQUEST" } } }]);
+        }
+        return chunks([{ type: "text-delta", index: 0, text: "[决定] 甲。\n\n[计划] 乙。" }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const cfg = { strategy: "iot-full", limits: { ...limitsOf("iot-full"), temperature: 0.2 } };
+  const result = await compressWith(ctx, { cfg, events, text: DRAFT.repeat(2) });
+  assert.ok(result && result.text.includes("[决定]"), "去掉 temperature 后应成功");
+  assert.equal(calls[0], 0.2);
+  assert.equal(calls[1], undefined, "第二次不发该字段");
+  assert.ok(events.some((entry) => entry.event === "thinking-temperature-fallback"));
+});
+
+await check("temperature：配置为 null 时从一开始就不发字段", async () => {
+  const calls = [];
+  const ctx = { llm: { stream: (options) => { calls.push(options.temperature); return chunks([{ type: "text-delta", index: 0, text: "[决定] 甲。" }, { type: "finish", reason: { kind: "stop" } }]); } } };
+  const cfg = { strategy: "iot-full", limits: { ...limitsOf("iot-full"), temperature: null } };
+  await compressWith(ctx, { cfg, text: DRAFT.repeat(2) });
+  assert.equal(calls[0], undefined);
+});
+
+await check("指导档位：显式档位原样发出；auto 被拒时降级并记账", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push(options.reasoningEffort ?? null);
+        // 这个假路由只认「不发字段」：任何显式档位都被拒。
+        if (options.reasoningEffort !== undefined && options.reasoningEffort !== null) {
+          return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "does not support reasoning effort", code: "INVALID_REQUEST" } } }]);
+        }
+        return chunks([{ type: "text-delta", index: 0, text: "[旁观者建议] 先补测试。" }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const raw = await advise({
+    ctx,
+    Llm: fakeLlm(),
+    route: { provider: "p", model: "m" },
+    prompt: "评审",
+    options: {},
+    timeoutMs: 5000,
+    effort: "auto",
+    onEvent: (event, fields) => events.push({ event, ...fields }),
+  });
+  assert.equal(raw, "[旁观者建议] 先补测试。", "降级后拿到正文");
+  assert.equal(calls.length, 2, "auto 先试 off，被拒后再发一次");
+  assert.equal(calls[0], "off");
+  assert.ok(events.some((entry) => entry.event === "advisor-effort-fallback"));
+});
+
+await check("指导档位：显式档位被拒时不擅自换档", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push(options.reasoningEffort ?? null);
+        return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "does not support reasoning effort", code: "INVALID_REQUEST" } } }]);
+      },
+    },
+  };
+  const raw = await advise({
+    ctx,
+    Llm: fakeLlm(),
+    route: { provider: "p", model: "m2" },
+    prompt: "评审",
+    options: {},
+    timeoutMs: 5000,
+    effort: "medium",
+    onEvent: (event, fields) => events.push({ event, ...fields }),
+  });
+  assert.equal(raw, null);
+  assert.equal(calls.length, 1, "显式档位只发一次");
+  assert.equal(calls[0], "medium");
+  assert.ok(events.some((entry) => entry.event === "advisor-failed"));
+});
+
+await check("指导调用只取正文：思考模型的 reasoning 块不混进建议", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: () => chunks([
+        { type: "reasoning-delta", index: 0, text: "我先想想他到底要什么……" },
+        { type: "text-delta", index: 0, text: "[旁观者建议] 先补替换闸门的测试。" },
+        { type: "finish", reason: { kind: "stop" } },
+        { type: "usage", usage: { completion_tokens: 300, completion_tokens_details: { reasoning_tokens: 240 } } },
+      ]),
+    },
+  };
+  const raw = await advise({
+    ctx,
+    Llm: fakeLlm(),
+    route: { provider: "p", model: "m" },
+    prompt: "评审",
+    options: {},
+    timeoutMs: 5000,
+    onEvent: (event, fields) => events.push({ event, ...fields }),
+  });
+  assert.equal(raw, "[旁观者建议] 先补替换闸门的测试。", "只取正文块");
+  assert.ok(!raw.includes("我先想想"), "内心独白不能混进来");
+  const usageEvent = events.find((entry) => entry.event === "advisor-usage");
+  assert.equal(usageEvent.reasoningTokens, 240);
+  assert.equal(usageEvent.reasoningShare, 0.8);
+});
+
+await check("指导调用正文为空：区分截断与只想不说，都返回 null", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: () => chunks([
+        { type: "reasoning-delta", index: 0, text: "想了很久但没写正文。" },
+        { type: "finish", reason: { kind: "max-tokens" } },
+      ]),
+    },
+  };
+  const raw = await advise({ ctx, Llm: fakeLlm(), route: { provider: "p", model: "m" }, prompt: "评审", options: {}, timeoutMs: 5000, onEvent: (event, fields) => events.push({ event, ...fields }) });
+  assert.equal(raw, null);
+  assert.ok(events.some((entry) => entry.event === "advisor-skipped" && entry.reason === "truncated-no-text"));
+});
+
+await check("标签归一：无方括号的「旁观者建议：」「建议：」也识别为建议节点", () => {
+  const out = formatNodes(
+    "[决定] 先做替换闸门。\n旁观者建议：先补测试。\n建议：把同步等待改成异步。",
+    { maxNodes: 8, maxNeutral: 2, labels: ["支持", "反对", "中性", "计划", "权衡", "待定", "风险", "决定", "旁观者建议"], allowAdvice: true },
+  );
+  assert.ok(out.includes("[旁观者建议] 先补测试。"), "无方括号的建议标签要归一");
+  assert.ok(out.includes("[旁观者建议] 把同步等待改成异步。"));
+  assert.ok(!/^(旁观者建议|建议)：/m.test(out), "不应残留裸标签");
+});
+
+await check("标签改名兼容：旧的 [指导] / 【指导】/ 指导： 都归一成 [旁观者建议]", () => {
+  const out = formatAdvice("[指导] 先补测试。\n【指导】把同步等待改成异步。\n指导：先看账本。", { maxAdvice: 3, maxChars: 600 });
+  const lines = out.split("\n\n");
+  assert.equal(lines.length, 3);
+  for (const line of lines) assert.ok(line.startsWith("[旁观者建议]"), "旧标签必须被改名");
+  assert.ok(!out.includes("[指导]"), "输出里不应残留旧标签");
+
+  // 内置建议模式：模型仍按旧标签输出时也要保留并改名。
+  const strategy = strategyById("iot-full");
+  const verdict = strategy.finalize("[决定] 先把替换闸门的判定顺序写成测试。\n\n[指导] 建议先补一个替换闸门的测试。", {
+    original: Array.from({ length: 40 }, (_, i) => "第" + i + "句草稿，内容各不相同。").join(""),
+    limits: { maxNodes: 2, maxNeutral: 2 },
+    allowAdvice: true,
+  });
+  assert.equal(verdict.ok, true);
+  assert.ok(verdict.text.includes("[旁观者建议]"), "旧标签要升级成新标签");
+  assert.ok(!verdict.text.includes("[指导]"));
+});
+
+await check("指导格式：只保留带标签的可执行建议，去重并限条数", () => {
+  const raw = "可以考虑一下。\n指导：先补测试。\n[指导] 先补测试。\n【指导】把同步等待改成异步。\n[指导] 太短";
+  const out = formatAdvice(raw, { maxAdvice: 2, maxChars: 600 });
+  assert.ok(out.startsWith("[旁观者建议] 先补测试。"));
+  assert.ok(out.includes("[旁观者建议] 把同步等待改成异步。"));
+  assert.equal(out.split("\n\n").length, 2, "重复项被去掉，且不超过 2 条");
+  assert.ok(!out.includes("可以考虑一下"), "没有标签的行不算建议");
+  assert.equal(appendAdvice("主体", out), `主体\n\n${out}`);
+  assert.equal(appendAdvice("主体", ""), "主体");
+});
+
+await check("指导路由：未配 route 时跟随压缩器路由，未启用返回 null", () => {
+  assert.equal(resolveAdvisorRoute({ advisor: { enabled: false } }, "custom", null), null);
+  const follow = resolveAdvisorRoute({ advisor: { enabled: true }, rewrite: { provider: "p", model: "m" } }, "custom", { provider: "s", model: "s" });
+  assert.equal(follow.provider, "p");
+  assert.equal(follow.source, "rewrite");
+  const own = resolveAdvisorRoute({ advisor: { enabled: true, route: { provider: "strong", model: "strong" } }, rewrite: { provider: "p", model: "m" } }, "custom", { provider: "p", model: "m" });
+  assert.equal(own.model, "strong");
+  assert.equal(own.offloaded, true, "与压缩路由不同就算卸载");
+});
+
+await check("指导开关走 guidance：advisor.enabled 没设也要能调用外部指导", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ model: options.model });
+        const text = options.model === "strong" ? "[旁观者建议] 先补测试。" : "[决定] 先做替换闸门。";
+        return chunks([{ type: "text-delta", index: 0, text }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const cfg = {
+    strategy: "iot-full",
+    rewrite: { provider: "weak", model: "weak" },
+    // 只有 guidance 与 advisor.route；advisor.enabled 刻意不写。
+    advisor: { route: { provider: "strong", model: "strong" }, maxAdvice: 3, maxChars: 600 },
+    guidance: { enabled: true, mode: "external" },
+  };
+  const result = await compressWith(ctx, { cfg, events, text: DRAFT.repeat(2) });
+  assert.ok(result, "压缩结果要保留");
+  assert.ok(result.advice && result.advice.includes("[旁观者建议]"), "外部指导要产出建议");
+  assert.ok(calls.some((call) => call.model === "strong"), "必须真的调用强模型");
+  assert.ok(events.some((entry) => entry.event === "advisor-called"), "要记账 advisor-called");
+});
+
+await check("指导提示词：把目标、骨架、最近结果都带上，并要求可执行", () => {
+  const prompt = buildAdvisorPrompt({ nodes: "[决定] 甲", goal: "把插件做稳", recent: ["跑了 selftest", "失败 2 项"], limits: { maxAdvice: 2, maxChars: 300 } });
+  assert.ok(prompt.includes("把插件做稳"));
+  assert.ok(prompt.includes("[决定] 甲"));
+  assert.ok(prompt.includes("跑了 selftest"));
+  assert.ok(prompt.includes("最多 2 条"));
+  assert.ok(prompt.includes("不要复述"));
+});
+
+await check("无标签输出：判 no-label 并重试一次，两次都无标签就保留原文", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([
+          { type: "text-delta", index: 0, text: "这段草稿其实是在继续思考，没有任何标签。" },
+          { type: "finish", reason: { kind: "stop" } },
+        ]);
+      },
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { strategy: "custom", rewriteBudget: 3, limits: { ...limitsOf("custom"), preset: { inline: "压短", name: "inline" }, acceptRule: "different" } }, events, text: DRAFT.repeat(2) });
+  assert.equal(result, null, "两次都无标签就保留原文");
+  assert.equal(calls.length, 2, "只重试一次");
+  assert.ok(events.some((entry) => entry.event === "thinking-no-label" && entry.retried === false));
+  assert.ok(events.some((entry) => entry.event === "thinking-no-label" && entry.retried === true));
+});
+
+await check("无标签检测在 formatNodes 之前：items 的 [中性] 补齐不能掩盖无标签输出", () => {
+  assert.equal(hasLabel("一、要点甲。\n\n二、要点乙。"), false);
+  assert.equal(hasLabel("[决定] 要点甲。"), true);
+  assert.equal(hasLabel("【决定】要点甲。"), true, "全角标签也认");
+  assert.equal(hasLabel("[决定] 甲", ["支持", "反对"]), false, "档位外的标签不算");
+  assert.equal(hasLabel("[支持] 甲", ["支持", "反对"]), true);
+});
+
+await check("三档基础模式也接受用户补充层，且空文本不改变旧行为", () => {
+  const strategy = strategyById("iot-full");
+  const plain = strategy.buildPrompt("草稿", { strict: false, limits: { maxTokens: 3000 } });
+  const withExtra = strategy.buildPrompt("草稿", { strict: false, limits: { maxTokens: 3000 }, extraPrompt: "只保留决定。" });
+  assert.ok(!plain.includes("用户补充要求"));
+  assert.ok(withExtra.includes("用户补充要求"));
+  assert.ok(withExtra.includes("只保留决定。"));
+  assert.ok(withExtra.indexOf("用户补充要求") < withExtra.indexOf("收尾约束"), "补充层在收尾约束之前");
+});
+
+await check("三层提示词：标签层在前、用户补充在中、收尾约束在后", () => {
+  const prompt = buildCustomPrompt("我的补充：只保留决定。", "草稿", { limits: { maxTokens: 2000, noThink: true } });
+  const labelAt = prompt.indexOf("只把草稿压缩成带标签的思维节点");
+  const userAt = prompt.indexOf("我的补充：只保留决定。");
+  const tailAt = prompt.indexOf("收尾约束");
+  assert.ok(labelAt >= 0 && userAt > labelAt && tailAt > userAt, "顺序必须是 标签层 -> 用户层 -> 收尾");
+  assert.ok(prompt.includes("只能补充，不能替掉上面的标签规则"));
+});
+
+await check("收尾约束：字符预算与 maxTokens 匹配，maxOut 优先", () => {
+  assert.ok(outputDiscipline({ maxTokens: 2000 }).includes("约 2400 个字符"));
+  assert.ok(outputDiscipline({ maxTokens: 2000, maxOut: 600 }).includes("约 600 个字符"));
+  assert.ok(outputDiscipline({ maxTokens: 2000 }).includes("2000 tokens"));
+});
+
+await check("输出纪律注入：预算与 noThink 会写进提示词", () => {
+  const prompt = buildCustomPrompt("压短", "草稿", { limits: { maxOut: 600, noThink: true } });
+  assert.ok(prompt.includes("不超过约 600 个字符"));
+  assert.ok(prompt.includes("<thinking>"));
+  assert.ok(prompt.includes("不要解释过程"));
+});
+
+await check("改写超时：模型一直吐字不结束，到点放弃并保留原文（不挂住会话）", async () => {
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        // 模拟"一直在吐字、永不 finish"，但会响应 abort。
+        let stop = false;
+        options.signal?.addEventListener?.("abort", () => { stop = true; });
+        return (async function* () {
+          for (let i = 0; i < 1000 && !stop; i += 1) {
+            yield { type: "text-delta", index: 0, text: "还在想。" };
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          if (stop) throw Object.assign(new Error("aborted by timeout"), { code: "ABORT_ERR" });
+          yield { type: "finish", reason: { kind: "stop" } };
+        })();
+      },
+    },
+  };
+  const started = Date.now();
+  const result = await compressWith(ctx, { cfg: { rewriteTimeoutMs: 1000 }, events });
+  const elapsed = Date.now() - started;
+  assert.equal(result, null, "超时就是保留原文");
+  assert.ok(elapsed < 4000, `不该挂住：实际 ${elapsed}ms`);
+  const failed = events.find((entry) => entry.event === "thinking-failed");
+  assert.equal(failed.code, "REWRITE_TIMEOUT");
+  assert.match(failed.message, /超时/);
+});
+
+await check("调用预算：一块最多打 N 次模型，退化输出不再无限重试", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        // 永远返回空输出：custom 的 judge 判 empty，会走重试路径。
+        return chunks([{ type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  // 用 custom 档位（没有确定性兜底）且输出为空：empty 会重试一次，
+  // 第二次仍空就该停，不能再打第三次。
+  const text = DRAFT.repeat(2);
+  await compressWith(ctx, {
+    cfg: { strategy: "custom", rewriteBudget: 1, limits: { ...limitsOf("custom"), preset: { inline: "把草稿压短", name: "inline" }, acceptRule: "different" } },
+    events,
+    text,
+  });
+  assert.equal(calls.length, 1, "预算就是硬上限：重试那一发不该出去");
+  const failed = events.find((entry) => entry.event === "thinking-failed");
+  assert.equal(failed.code, "REWRITE_BUDGET");
+});
+
+await check("调用预算：默认值在合理区间，非法值被夹紧", () => {
+  assert.ok(REWRITE_BUDGET.defaultCalls >= 2 && REWRITE_BUDGET.defaultCalls <= 8);
+  assert.ok(REWRITE_BUDGET.minCalls >= 1 && REWRITE_BUDGET.maxCalls >= REWRITE_BUDGET.defaultCalls);
+});
+
+await check("改写超时：下限/上限夹紧，非法值回落默认", () => {
+  assert.equal(REWRITE_TIMEOUT.defaultMs, 120000);
+  assert.ok(REWRITE_TIMEOUT.minMs >= 1000 && REWRITE_TIMEOUT.maxMs >= REWRITE_TIMEOUT.defaultMs);
+});
+
+await check("卸载失败 + fallback=keep：保留原文，不回退重试", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "boom", code: "PROVIDER_ERROR" } } }]);
+      },
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { rewrite: { provider: "local-p", model: "small", fallback: "keep" } }, events });
+  assert.equal(result, null, "失败就是保留原文");
+  assert.equal(calls.length, 1, "keep 不该回退重试");
+  assert.ok(events.some((entry) => entry.event === "thinking-failed"));
+  assert.ok(!events.some((entry) => entry.event === "rewrite-route-fallback"));
+});
+
+await check("卸载失败 + fallback=session：回退到会话路由再试一次", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        if (options.provider === "local-p") {
+          return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "local route down", code: "ECONNREFUSED" } } }]);
+        }
+        return chunks([{ type: "text-delta", index: 0, text: GOOD }, { type: "finish", reason: { kind: "stop" } }]);
+      },
+    },
+  };
+  const result = await compressWith(ctx, { cfg: { rewrite: { provider: "local-p", model: "small", fallback: "session" } }, events });
+  assert.equal(result?.text, GOOD);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].provider, "local-p");
+  assert.equal(calls[1].provider, "p", "回退到会话路由");
+  const fallback = events.find((entry) => entry.event === "rewrite-route-fallback");
+  assert.equal(fallback.from.provider, "local-p");
+  assert.equal(fallback.to.provider, "p");
+  assert.equal(result.event.provider, "p", "记账要写实际用过的路由");
+  assert.equal(result.event.offloaded, false, "回退之后就不算卸载了");
+});
+
+await check("卸载到与会话相同的路由时不做无意义的回退", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([{ type: "finish", reason: { kind: "error", failure: { message: "boom", code: "PROVIDER_ERROR" } } }]);
+      },
+    },
+  };
+  await compressWith(ctx, { cfg: { rewrite: { provider: "p", model: "m", fallback: "session" } }, events });
+  assert.equal(calls.length, 1, "同一条路由不该再打一次");
+  assert.ok(!events.some((entry) => entry.event === "rewrite-route-fallback"));
+});
+
+await check("卸载失败 + 用户按 Esc 中断：不重试", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    llm: {
+      stream: (options) => {
+        calls.push({ ...options });
+        return chunks([{ type: "finish", reason: { kind: "aborted", failure: { message: "aborted", code: "ABORTED" } } }]);
+      },
+    },
+  };
+  await compressWith(ctx, { cfg: { rewrite: { provider: "local-p", model: "small", fallback: "session" } }, events });
+  assert.equal(calls.length, 1, "中断是用户的决定，不是路由的错");
+  assert.ok(events.some((entry) => entry.event === "thinking-skipped" && entry.reason === "aborted"));
+});
+
 
 
 
@@ -1514,7 +3208,7 @@ function fakeRewriteLlm(reply) {
           .map((chunk) => ({ type: "text", text: chunk.text }));
       }
     },
-    createUserMessage: (input) => input,
+    createUserMessage: strictCreateUserMessage,
   };
   const ctx = {
     llm: {
@@ -1660,11 +3354,11 @@ await check("自定义预设的提示词：默认包进 thinking，写了 draft 
   const wrapped = buildCustomPrompt("把草稿压成三条要点。", "原始草稿内容");
   assert.match(wrapped, /把草稿压成三条要点。/);
   assert.ok(wrapped.includes("<thinking>\n原始草稿内容\n</thinking>"), "草稿要包进 thinking 块");
-  assert.match(wrapped, /现在只输出改写后的内容/);
+  assert.match(wrapped, /现在只输出思维节点/);
 
   const template = buildCustomPrompt("按此改写：\n{{draft}}\n只输出结果。", "原始草稿内容");
   assert.match(template, /按此改写：\n原始草稿内容\n只输出结果。/);
-  assert.ok(!template.includes("<thinking>"), "模板模式不再追加包装");
+  assert.ok(template.includes("每行必须以方括号标签开头"), "模板模式也要带标签层与收尾约束");
 
   // 严格重试带针对性指令。
   assert.match(buildCustomPrompt("规则", "草稿", { strict: true, reason: "degenerate" }), /退化成重复内容/);
@@ -1685,7 +3379,7 @@ await check("自定义预设的改写：成功时返回文本（verdict.text 缺
   const ctx = {
     llm: {
       stream: () => chunks([
-        { type: "text-delta", index: 0, text: "一、要点甲。\n\n二、要点乙。" },
+        { type: "text-delta", index: 0, text: "[决定] 要点甲。\n\n[计划] 要点乙。" },
         { type: "finish", reason: { kind: "stop" } },
       ]),
     },
@@ -1704,10 +3398,13 @@ await check("自定义预设的改写：成功时返回文本（verdict.text 缺
   assert.ok(result, "改写应当成功（预设可用、输出非空）");
   assert.equal(typeof result.text, "string");
   assert.match(result.text, /要点甲/);
-  assert.equal(result.event.strategy, "custom");
+  // 旧 custom 档已迁移成「完整档 + 用户注入」：账本记的是实际执行档位。
+  assert.equal(result.event.strategy, "iot-full");
+  assert.ok(events.every((entry) => entry.event !== "inject-unusable"), "预设必须能解析成注入");
   assert.equal(result.event.charsOut, result.text.length);
   assert.ok(Number.isFinite(result.event.charsIn), "charsIn 也要有");
-  assert.ok(Number.isFinite(result.event.lines), "自定义预设写 lines 指标，而不是 nodes");
+  // 迁移后走完整档：账本指标从 lines 变成 nodes（档位语义变了，字段也跟着变）。
+  assert.ok(Number.isFinite(result.event.nodes), "完整档写 nodes 指标");
   assert.equal(events.filter((entry) => entry.event === "thinking-failed").length, 0, "不应记 thinking-failed");
 });
 
@@ -1738,7 +3435,8 @@ await check("resolveConfig：自定义预设把内容装进 limits.preset，替�
     presetAccept: "shorter",
   };
   const fileScoped = resolveConfig(cfg, {});
-  assert.equal(fileScoped.strategy, "custom");
+  assert.equal(fileScoped.strategy, "iot-full", "旧 custom 档迁移成完整档");
+  assert.equal(fileScoped.inject, "custom:my-style", "内容以注入形式继续生效");
   assert.equal(fileScoped.limits.preset.name, "my-style");
   assert.equal(fileScoped.limits.preset.dir, dir);
   assert.equal(fileScoped.limits.acceptRule, "shorter");
@@ -1895,7 +3593,9 @@ await check("session API：GET 说明解析来源，PUT 写覆盖并可清回跟
   assert.equal(read.payload.route.source, "preset");
   assert.equal(read.payload.override, null);
   // 两级值域：第一级是档位（三档 + custom + off），第二级是具体预设
-  assert.deepEqual(read.payload.choices.tiers.map((entry) => entry.value), ["iot-compact", "iot-balanced", "iot-full", "custom", "off"]);
+  assert.deepEqual(read.payload.choices.tiers.map((entry) => entry.value), ["iot-compact", "iot-balanced", "iot-full", "off"]);
+  assert.ok(Array.isArray(read.payload.choices.injects), "注入候选要单独给");
+  assert.equal(read.payload.choices.injects[0].value, "", "第一项是「不注入」");
   assert.ok(Array.isArray(read.payload.choices.presets), "第二级是预设清单");
   assert.equal(typeof read.payload.choices.presetDirSet, "boolean");
 
@@ -1924,6 +3624,23 @@ await check("session API：GET 说明解析来源，PUT 写覆盖并可清回跟
   assert.equal(bad.statusCode, 400);
   const noId = await ws.call("/iot-thinking/api/session", { method: "PUT", body: JSON.stringify({ strategy: "iot-full" }) });
   assert.equal(noId.statusCode, 400);
+});
+
+await check("配置损坏保留原字节、冷启动关闭、恢复后重读，教师增量保存不重置预算", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iot-config-corrupt-"));
+  const file = join(dir, "config.json");
+  const broken = '{"enabled": false, BROKEN';
+  writeFileSync(file, broken, "utf8");
+  const store = new ConfigStore(file, {});
+  assert.equal(store.load().enabled, false, "冷启动坏配置必须 fail closed");
+  assert.equal(readFileSync(file, "utf8"), broken, "坏配置原字节不得被默认值覆盖");
+  assert.equal(store.lastError?.code, "CONFIG_PARSE_FAILED");
+  assert.throws(() => store.save({ enabled: true }), { code: "CONFIG_PARSE_FAILED" });
+  writeFileSync(file, JSON.stringify({ enabled: true, advisor: { teacher: { enabled: true, cooldownBlocks: 9, inputBudget: 23000, maxTokens: 2222, timeoutMs: 44000 } } }), "utf8");
+  assert.equal(store.load().enabled, true, "有效配置恢复后应自动重读");
+  store.save({ advisor: { teacher: { enabled: false } } });
+  const teacher = store.load().advisor.teacher;
+  assert.deepEqual(teacher, { enabled: false, cooldownBlocks: 9, depthRange: [1, 5], inputBudget: 23000, maxTokens: 2222, timeoutMs: 44000 });
 });
 
 await check("config API：映射表是整表替换 —— 删除与清空都能落盘", async () => {
@@ -1970,6 +3687,226 @@ await check("config API：映射表是整表替换 —— 删除与清空都能�
     body: JSON.stringify({ agentPresets: { jingjing: "custom:my-style" } }),
   });
   assert.deepEqual(custom.payload.config.agentPresets, { jingjing: "custom:my-style" });
+});
+
+await check("指导：会话覆盖优先于全局，null 表示跟随全局", () => {
+  const global = resolveConfig({ strategy: "iot-full", guidance: { enabled: true, mode: "external" } }, { sessionId: "s" });
+  assert.deepEqual(global.guidance, { enabled: true, mode: "external" });
+
+  const off = resolveConfig({
+    strategy: "iot-full",
+    guidance: { enabled: true, mode: "external" },
+    sessions: { s: { strategy: "iot-full", guidance: { enabled: false } } },
+  }, { sessionId: "s" });
+  assert.equal(off.guidance.enabled, false, "会话可以关掉指导");
+  assert.equal(off.guidance.mode, "external", "只给 enabled 时模式继承全局");
+
+  const follow = resolveConfig({
+    strategy: "iot-full",
+    guidance: { enabled: true, mode: "builtin" },
+    sessions: { s: { strategy: "iot-full", guidance: null } },
+  }, { sessionId: "s" });
+  assert.deepEqual(follow.guidance, { enabled: true, mode: "builtin" }, "null 跟随全局");
+
+  const builtin = resolveConfig({
+    strategy: "iot-full",
+    guidance: { enabled: true, mode: "external" },
+    sessions: { s: { strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } } },
+  }, { sessionId: "s" });
+  assert.equal(builtin.guidance.mode, "builtin", "会话可以切模式");
+});
+
+await check("指导档位在没有显式配置时等价于内置指导，旧行为不变", () => {
+  const guided = resolveConfig({ strategy: "iot-guided" }, { sessionId: "s" });
+  assert.deepEqual(guided.guidance, { enabled: true, mode: "builtin" });
+  const plain = resolveConfig({ strategy: "iot-full" }, { sessionId: "s" });
+  assert.equal(plain.guidance.enabled, false, "普通档默认不开指导");
+});
+
+await check("session API：指导覆盖与档位分开落盘，清除档位不丢指导", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-session-guidance-")), "config.json"));
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const put = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s-guidance", strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } }),
+  });
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(put.payload.override, { strategy: "iot-full", guidance: { enabled: true, mode: "builtin" } });
+
+  const get = await ws.call("/iot-thinking/api/session", { url: "/iot-thinking/api/session?sessionId=s-guidance" });
+  assert.deepEqual(get.payload.override.guidance, { enabled: true, mode: "builtin" }, "GET 要能还原指导覆盖");
+  assert.equal(get.payload.guidance.effective.mode, "builtin");
+
+  // 只清档位：指导覆盖必须留着。
+  const cleared = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s-guidance", strategy: null }),
+  });
+  assert.deepEqual(cleared.payload.override, { guidance: { enabled: true, mode: "builtin" } });
+
+  // 再清指导：整条覆盖消失。
+  const gone = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s-guidance", strategy: null, guidance: null }),
+  });
+  assert.equal(gone.payload.override, null);
+});
+
+await check("自测路由：外部指导的输出要回传并合并进展示文本", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-test-advice-")), "config.json"));
+  store.save({ strategy: "iot-full", rewrite: { provider: "p", model: "m" }, guidance: { enabled: true, mode: "external" } });
+  registerConfigApi(testCtx(ws), store, {
+    rewrite: async () => ({
+      text: "[决定] 甲。",
+      event: { strategy: "iot-full", finish: "stop" },
+      advice: "[旁观者建议] 先补替换闸门的测试。",
+    }),
+    getRoute: () => ({ provider: "p", model: "m" }),
+  });
+
+  const res = await ws.call("/iot-thinking/api/test", {
+    method: "POST",
+    body: JSON.stringify({ strategy: "iot-full", text: DRAFT.repeat(3) }),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload.advice, "[旁观者建议] 先补替换闸门的测试。", "指导要单独回传");
+  assert.ok(res.payload.text.includes("[旁观者建议]"), "展示文本要包含指导");
+  assert.equal(res.payload.charsOutBody, "[决定] 甲。".length, "主体字数单独给出");
+});
+
+await check("自测路由：返回报文 trace 与本次指导模式，便于 Log 窗口比对", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-test-trace-")), "config.json"));
+  store.save({ strategy: "iot-full", rewrite: { provider: "p", model: "m" }, guidance: { enabled: true, mode: "external" } });
+  registerConfigApi(testCtx(ws), store, {
+    rewrite: async (text, options, cfg, index, extra) => {
+      extra?.trace?.push({ stage: "first", provider: "p", model: "m", prompt: "PROMPT", raw: "RAW", finish: "stop", usage: null, error: null, code: null });
+      return { text: "[决定] 甲。", event: { strategy: "iot-full", finish: "stop" } };
+    },
+    getRoute: () => ({ provider: "p", model: "m" }),
+  });
+
+  const res = await ws.call("/iot-thinking/api/test", {
+    method: "POST",
+    body: JSON.stringify({ strategy: "iot-full", guidance: { enabled: true, mode: "builtin" }, text: DRAFT.repeat(3) }),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.payload.guidance, { enabled: true, mode: "builtin" }, "自测要能点名指导模式");
+  assert.equal(res.payload.trace[0].prompt, "PROMPT");
+  assert.equal(res.payload.trace[0].raw, "RAW");
+});
+
+await check("session API：会话级 prompt 与档位一起落盘，未知内置名被拒", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-session-preset-")), "config.json"));
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const put = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s-preset", strategy: "custom", preset: "builtin:deep" }),
+  });
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(put.payload.override, { strategy: "custom", preset: "builtin:deep" }, "会话覆盖要保留 prompt");
+  assert.equal(put.payload.route.id, "custom");
+
+  const get = await ws.call("/iot-thinking/api/session", { url: "/iot-thinking/api/session?sessionId=s-preset" });
+  assert.deepEqual(get.payload.override, { strategy: "custom", preset: "builtin:deep" }, "GET 要能还原");
+  assert.equal(get.payload.choices.builtinPresets.length, 2);
+
+  const bad = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s-preset", strategy: "custom", preset: "builtin:nope" }),
+  });
+  assert.equal(bad.statusCode, 400, "未知内置名不能静默落盘");
+
+  // 清除覆盖。
+  const cleared = await ws.call("/iot-thinking/api/session", {
+    method: "PUT",
+    body: JSON.stringify({ sessionId: "s-preset", strategy: null }),
+  });
+  assert.equal(cleared.payload.override, null);
+});
+
+await check("config API：defaultPreset 只收三种形态，未知内置名不落盘", async () => {
+  const ws = fakeWebServer();
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-default-preset-")), "config.json"));
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const builtin = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ defaultPreset: "builtin:standard" }),
+  });
+  assert.equal(builtin.payload.config.defaultPreset, "builtin:standard");
+
+  const file = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ defaultPreset: "custom:my-style" }),
+  });
+  assert.equal(file.payload.config.defaultPreset, "custom:my-style");
+
+  const inline = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ defaultPreset: "custom" }),
+  });
+  assert.equal(inline.payload.config.defaultPreset, "custom");
+
+  const junk = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ defaultPreset: "iot-full" }),
+  });
+  assert.equal(junk.payload.config.defaultPreset, "custom", "非法值不该覆盖已有的合法值");
+});
+
+await check("config API：rewrite 路由能落盘、能增量改、非法值被挡，且只报警不拒绝", async () => {
+  const ws = fakeWebServer();
+  // 用真 store：深合并与归一化就在它里面，假 store 会把这些行为测丢。
+  const store = new ConfigStore(join(mkdtempSync(join(tmpdir(), "iot-rewrite-api-")), "config.json"));
+  registerConfigApi(testCtx(ws), store, { rewrite: async () => "x", getRoute: () => ({ provider: "p", model: "m" }) });
+
+  const put = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ rewrite: { provider: "local-llama", model: "qwen3-4b", fallback: "session" } }),
+  });
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(put.payload.config.rewrite, { provider: "local-llama", model: "qwen3-4b", effort: "auto", fallback: "session" });
+  assert.ok(
+    Array.isArray(put.payload.warnings) && put.payload.warnings.some((line) => line.includes("local-llama")),
+    "不在注册表里的 provider 要报警（但不拒绝保存）",
+  );
+
+  // 增量改 model：不能把 provider 抹掉。
+  const patch = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ rewrite: { model: "other" } }),
+  });
+  assert.equal(patch.payload.config.rewrite.provider, "local-llama", "增量改 model 不能把 provider 抹掉");
+  assert.equal(patch.payload.config.rewrite.model, "other");
+
+  // 清掉路由不等于清掉失败策略。
+  const cleared = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ rewrite: { provider: null, model: null } }),
+  });
+  assert.equal(cleared.payload.config.rewrite.provider, null);
+  assert.equal(cleared.payload.config.rewrite.fallback, "session", "清路由不该清失败策略");
+
+  // 已知 provider/model 不该报警。
+  const known = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ rewrite: { provider: "deepseek-official", model: "deepseek-flash" } }),
+  });
+  assert.equal(known.payload.warnings, undefined, "解析得通就不该有 warnings");
+
+  // 旧卡片发的顶层 provider/model 折进 rewrite，行为不变。
+  const legacy = await ws.call("/iot-thinking/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ provider: "tyds", model: "gapi-gemini-3.8-flash" }),
+  });
+  assert.equal(legacy.payload.config.rewrite.provider, "tyds");
+  assert.equal(legacy.payload.config.rewrite.model, "gapi-gemini-3.8-flash");
 });
 
 await check("映射项：custom / custom:名字 都能解析，老对象形态仍读得懂", () => {
@@ -2033,7 +3970,8 @@ await check("/iot custom:名字：会话内指定自定义预设；没有内容�
   assert.ok(marked.some((entry) => entry.event === "strategy-switched" && entry.strategy === "custom"));
 
   const resolved = resolveConfig(store.load(), { sessionId: "s-2" });
-  assert.equal(resolved.strategy, "custom");
+  assert.equal(resolved.strategy, "iot-full", "旧 custom 档迁移成完整档");
+  assert.equal(resolved.inject, "custom:my-style", "内容以注入形式继续生效");
   assert.equal(resolved.limits.preset.name, "my-style");
 
   // 贴入文本为空时 custom 应当被拒（否则等于静默关掉改写）。

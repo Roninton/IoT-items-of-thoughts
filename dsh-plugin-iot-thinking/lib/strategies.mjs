@@ -13,6 +13,7 @@ import {
 } from "./think.mjs";
 import { judge, stylometry } from "./gates.mjs";
 import { buildCustomPrompt, readPreset } from "./custom.mjs";
+import { builtinPresetById, builtinPresetText } from "./builtin-presets.mjs";
 
 /** 基础三档的替换规则：候选必须非空且严格更短。 */
 export function isShorterReplacement(original, candidate) {
@@ -45,22 +46,33 @@ function itemsStrategy({ id, label, profile, summary, defaults }) {
     defaults: Object.freeze({
       minChars: 400,
       maxChars: 24000,
-      maxTokens: 2000,
+      maxTokens: 3000,
       temperature: 0.2,
       maxNodes: profileDef.maxNodes,
       maxNeutral: profileDef.maxNeutral,
       ...defaults,
     }),
     accept: "shorter",
+    /** 合法标签集：输出必须至少命中一个，否则判 no-label。 */
+    labels: profileDef.labels,
     retryEvent: "thinking-degenerate",
     accepts: (original, candidate) => isShorterReplacement(original, candidate),
     prepare: () => ({ state: null, error: null }),
     skipInput: (draft) => (isDegenerateDraft(draft) || !sanitizeDraft(draft).trim() ? "degenerate-input" : null),
-    buildPrompt: (draft, { strict }) => buildCompressionPrompt(draft, { profile, strict }),
-    finalize: (raw, { limits }) => {
+    // 用户补充层：三档基础模式也接受一段用户文本作为标签补充。
+    // 空文本时行为与旧版完全一致（不注入任何额外要求）。
+    buildPrompt: (draft, { strict, limits, extraPrompt, allowAdvice }) =>
+      buildCompressionPrompt(draft, { profile, strict, limits, extraPrompt, allowAdvice }),
+    finalize: (raw, { limits, allowAdvice }) => {
       // 先看原始输出：formatNodes 会把退化输出整理得"看起来正常"。
       const rawDegenerate = isDegenerateItems(raw);
-      const text = formatNodes(raw, { profile, maxNodes: limits.maxNodes, maxNeutral: limits.maxNeutral });
+      const text = formatNodes(raw, {
+        profile,
+        maxNodes: limits.maxNodes,
+        maxNeutral: limits.maxNeutral,
+        // 内置建议模式：建议节点不计入预算，也不能被当成未知标签裁掉。
+        allowAdvice: allowAdvice === true,
+      });
       if (rawDegenerate) return { ok: false, text, reason: "degenerate", detail: "raw" };
       if (!text) return { ok: false, text, reason: "empty" };
       if (isDegenerateItems(text)) return { ok: false, text, reason: "degenerate" };
@@ -77,18 +89,19 @@ function itemsStrategy({ id, label, profile, summary, defaults }) {
 function customStrategy() {
   return Object.freeze({
     id: "custom",
-    label: "自定义预设（第 4 项）",
+    label: "用户配置",
     family: "custom",
     summary: "用你自己的文本当改写指令：从你指定的预设目录选一份，或直接粘进来。",
     defaults: Object.freeze({
       minChars: 100,
       maxChars: 24000,
-      maxTokens: 2000,
+      maxTokens: 3000,
       temperature: 0.4,
       acceptRule: "different",
       preset: null,
     }),
     accept: "different",
+    labels: PROFILES.full.labels,
     retryEvent: "thinking-rejected",
     accepts: (original, candidate, limits) => {
       const rule = limits?.acceptRule === "shorter" ? "shorter" : "different";
@@ -97,6 +110,14 @@ function customStrategy() {
     prepare: (limits) => {
       const preset = limits?.preset;
       if (!preset) return { state: null, error: "还没选自定义预设" };
+      // 内置预设：只读、随插件发布，不需要 presetDir。
+      if (preset.kind === "builtin" || preset.builtin) {
+        const builtin = builtinPresetById(preset.name ?? preset.builtin);
+        if (!builtin) return { state: null, error: `没有这个内置预设：${String(preset.name ?? preset.builtin)}` };
+        // 内置预设可编辑：用户在 config.builtinOverrides 里存的正文优先。
+        const text = builtinPresetText(builtin.id, preset.overrides ?? {});
+        return { state: { text, label: builtin.name, path: `builtin:${builtin.id}`, edited: text !== builtin.text }, error: null };
+      }
       if (preset.inline) {
         const text = String(preset.inline).trim();
         if (!text) return { state: null, error: "自定义预设是空的（贴一段文本，或从目录选一份）" };
@@ -109,12 +130,22 @@ function customStrategy() {
       return { state: { text: loaded.text, label: preset.name }, error: null };
     },
     skipInput: (draft) => (String(draft ?? "").trim() ? null : "empty-draft"),
-    buildPrompt: (draft, { strict, reason, detail, state }) =>
-      buildCustomPrompt(state?.text ?? "", draft, { strict, reason, detail }),
-    finalize: (raw, { original }) => {
+    buildPrompt: (draft, { strict, reason, detail, state, limits, allowAdvice }) =>
+      buildCustomPrompt(state?.text ?? "", draft, { strict, reason, detail, limits, allowAdvice }),
+    finalize: (raw, { original, limits }) => {
       // 必须带上 text：引擎在成功分支里读 verdict.text（items 档位也是这么返回的）。
       const out = String(raw ?? "").trim();
-      return { ...judge(out, { original, minOut: 4 }), text: out };
+      return {
+        ...judge(out, {
+          original,
+          minOut: 4,
+          // 输出预算与"不许在输出里思考"是压缩器自己的约束：模型不遵守时
+          // 要有确定性后果，而不是靠提示词求它。
+          maxOut: Number.isFinite(limits?.maxOut) ? limits.maxOut : 0,
+          noThink: limits?.noThink === true,
+        }),
+        text: out,
+      };
     },
     fallback: () => null,
     metrics: (text) => stylometry(text),
@@ -142,21 +173,21 @@ function offStrategy() {
 export const STRATEGIES = Object.freeze([
   itemsStrategy({
     id: "iot-compact",
-    label: "决策 · 极简（3 标签）",
+    label: "压缩 · 极简（3 标签）",
     profile: "compact",
     summary: "3 标签、3~4 条节点。压得最狠，适合只想赶快接着干的短任务。",
     defaults: {},
   }),
   itemsStrategy({
     id: "iot-balanced",
-    label: "决策 · 均衡（5 标签）",
+    label: "压缩 · 均衡（5 标签）",
     profile: "balanced",
     summary: "5 标签、4~6 条节点，保留 [计划] 与 [决定]。",
     defaults: {},
   }),
   itemsStrategy({
     id: "iot-full",
-    label: "决策 · 完整（8 标签）",
+    label: "压缩 · 完整（8 标签）",
     profile: "full",
     summary: "8 标签、4~6 条节点。[权衡]/[风险]/[待定] 都保留，质量优先。",
     defaults: {},
