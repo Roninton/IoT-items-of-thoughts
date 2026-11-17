@@ -202,7 +202,12 @@ export class IotCompactionEngine extends BasicCompactionEngine {
       ...(input.tools === undefined ? {} : { tools: [...input.tools] }),
       maxTokens: this.iot.maxTokens,
       sessionId: agent?.session?.id,
-      purpose: "compaction",
+      // 不要声明 "compaction"：billion-context 代理只特判这一个值，把它当作
+      // 「声明式 dsh 原生 compaction」——无会话时 422 dsh_compaction_refused（bili_final，
+      // 不可重试），有会话时更糟：回一段自撰 checkpoint，本插件的提纯结果被静默吞掉。
+      // 声明自有 purpose 即走 side-request 路径。原因与修法同
+      // dsh-plugin-iot-thinking/lib/compress.mjs。
+      purpose: "iot-compaction",
       ...(signal === undefined ? {} : { signal }),
     };
 
