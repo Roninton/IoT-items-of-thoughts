@@ -205,7 +205,9 @@ assert.ok(emitted.some((chunk) => chunk.type === "text-delta" && chunk.text === 
 assert.equal(compressorCalls.length, 2, `expected 2 compressor calls, got ${compressorCalls.length}`);
 assert.equal(compressorCalls[0].reasoningEffort, "off");
 assert.equal(compressorCalls[1].reasoningEffort, "low", "auto mode picks the route's cheap level");
-assert.equal(compressorCalls[0].purpose, "compaction");
+// 不能声明 "compaction"：bili 代理会把声明式 compaction 拦成 422 dsh_compaction_refused
+// （会话内有块时更糟——直接回一段伪造 checkpoint，改写被静默吞掉）。
+assert.equal(compressorCalls[0].purpose, "iot-thinking");
 assert.deepEqual(compressorCalls[0].messages[0].source, { kind: "plugin", plugin: "iot-thinking" });
 
 const ledger = join(process.env.IOT_THINKING_DATA_DIR, "events.jsonl");
