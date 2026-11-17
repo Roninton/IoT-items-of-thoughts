@@ -110,8 +110,16 @@ export async function compressThinking({ Llm, ctx, text, options, cfg, index, ex
         ],
         maxTokens,
         sessionId: options.sessionId,
-        // 辅助调用：合法的 purpose，且不是 agent-loop 请求，所以自己的钩子会忽略它。
-        purpose: "compaction",
+        // 辅助调用：必须声明一个**非 compaction** 的 purpose —— 不能再用 "compaction"。
+        // bili 代理（billion-context）只特判这一个值：把 x-bili-plugin-purpose: compaction
+        // 当作"声明式原生 compaction"拦截（#1729/#6880，opt-in 已移除，bili_final 不可重试）：
+        //   · 会话内有 active 块 → 直接 200 回一段自撰 bili-snapshot checkpoint（上游不联系，
+        //     改写被静默换成 1.8 万字符的伪造摘要，插件只会判成 not-shorter 而丢弃）；
+        //   · 无会话（自测用的伪 sessionId "iot-thinking-self-test"）→ 422 dsh_compaction_refused。
+        // 换成任意自有 purpose 即走 bili 的 side-request 路径（isSideRequest: purpose 非空 ⇒ 辅助调用），
+        // 且不会把这次辅助调用计成会话回合。插件自身钩子由 shouldTransform 的第一道判据挡住
+        // （isAgentLoopRequest 是 WeakSet 身份判定，手搓请求天然不命中），与 purpose 取值无关。
+        purpose: "iot-thinking",
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
       for await (const chunk of stream) assembler.push(chunk);
